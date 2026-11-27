@@ -40,26 +40,6 @@ function templateMeta(zhName: string, enName: string, zhDesc: string, enDesc: st
   };
 }
 
-export const TASK_STATUS_ORDER = [
-  'inbox',
-  'queued',
-  'running',
-  'waiting_approval',
-  'paused',
-  'completed',
-  'blocked',
-] as const;
-
-export const TASK_STATUS: Record<string, ToneMeta> = {
-  inbox: tone('收件箱', 'Inbox', 'text-muted', 'bg-soft', 'bg-muted'),
-  queued: tone('排队中', 'Queued', 'text-info', 'bg-info/10', 'bg-info'),
-  running: tone('运行中', 'Running', 'text-primary', 'bg-primary/10', 'bg-primary'),
-  waiting_approval: tone('待审批', 'Awaiting approval', 'text-warn', 'bg-warn/10', 'bg-warn'),
-  paused: tone('已暂停', 'Paused', 'text-info', 'bg-info/10', 'bg-info'),
-  completed: tone('已完成', 'Completed', 'text-success', 'bg-success/10', 'bg-success'),
-  blocked: tone('已阻塞', 'Blocked', 'text-danger', 'bg-danger/10', 'bg-danger'),
-};
-
 export const RUN_STATUS: Record<string, ToneMeta> = {
   starting: tone('启动中', 'Starting', 'text-info', 'bg-info/10', 'bg-info'),
   running: tone('运行中', 'Running', 'text-primary', 'bg-primary/10', 'bg-primary'),

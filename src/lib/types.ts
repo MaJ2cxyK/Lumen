@@ -194,11 +194,9 @@ export type TaskStatus =
   | 'running'
   | 'waiting_approval'
   | 'paused'
-  | 'paused_budget'
   | 'completed'
   | 'blocked'
-  | 'cancelled'
-  | 'failed';
+  | 'cancelled';
 
 export interface Task {
   id: string;
@@ -219,7 +217,7 @@ export interface Task {
   workDir?: string | null;
   /** 隔离工作区仍有未提交或未应用的改动，等待审查。 */
   reviewPending?: boolean;
-  status: string;
+  status: TaskStatus;
   priority: number;
   assigneeSeatId?: string | null;
   stageIndex: number;

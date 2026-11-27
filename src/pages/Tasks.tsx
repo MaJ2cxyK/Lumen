@@ -15,7 +15,16 @@ import { api, errorMessage } from '../lib/api';
 import type { Task, Team } from '../lib/types';
 import { priorityMeta } from '../lib/labels';
 import { tr, useI18n } from '../lib/i18n';
-import { TASK_STAGE_ORDER, isReviewPending, taskStage } from '../lib/taskStage';
+import {
+  canCancelStatus,
+  canDispatchStatus,
+  canResetStatus,
+  isReviewPending,
+  stageColumns,
+  stageCount,
+  stageDescriptor,
+  statusDescriptor,
+} from '../lib/taskLifecycle';
 import { formatTokens, fromNow, microsToUsd } from '../lib/format';
 import { useAppStore } from '../store';
 import {
@@ -360,17 +369,23 @@ export default function Tasks() {
       ) : (
         <div className="space-y-4">
           <div className="-mx-1 flex gap-4 overflow-x-auto px-1 pb-2">
-          {TASK_STAGE_ORDER.map((status) => {
-            const meta = taskStage(status);
-            const items = tasks.filter((task) => task.status === status);
+          {stageColumns([
+            ...tasks.map((task) => task.status),
+            ...Object.keys(statusCounts),
+          ]).map((stage) => {
+            const meta = stageDescriptor(stage);
+            const items = tasks.filter(
+              (task) => statusDescriptor(task.status).stage === stage,
+            );
+            const count = stageCount(stage, statusCounts, items.length);
             return (
-              <div key={status} className="flex w-[280px] shrink-0 flex-col">
+              <div key={stage} className="flex w-[280px] shrink-0 flex-col">
                 <div className="mb-2 flex items-center justify-between px-1">
                   <div className="flex items-center gap-2">
                     <span className={cn('h-2 w-2 rounded-full', meta.dot)} />
                     <span className="text-sm font-semibold text-ink">{meta.label}</span>
                     <span className="min-w-[20px] rounded-full bg-soft px-1.5 py-0.5 text-center text-xs font-medium text-muted">
-                      {statusCounts[status] ?? items.length}
+                      {count}
                     </span>
                   </div>
                 </div>
@@ -382,6 +397,7 @@ export default function Tasks() {
                   ) : (
                     items.map((task) => {
                       const priority = priorityMeta(task.priority);
+                      const status = statusDescriptor(task.status);
                       return (
                         <div
                           key={task.id}
@@ -402,7 +418,10 @@ export default function Tasks() {
                               <span className="truncate">
                                 {task.teamName ?? t('未选择团队', 'No team')}
                               </span>
-                              {taskStage(task.status).waitingOn === 'you' && (
+                              {status.stage === 'closed' && (
+                                <TaskStatusBadge status={task.status} />
+                              )}
+                              {status.attention && (
                                 <Badge className="shrink-0">
                                   <span className="h-1.5 w-1.5 rounded-full bg-warn" />
                                   {t('等你', 'Needs you')}
@@ -434,7 +453,10 @@ export default function Tasks() {
                               size="xs"
                               title={t('派发', 'Dispatch')}
                               className="opacity-60 group-hover:opacity-100"
-                              disabled={busy === `${task.id}:dispatch`}
+                              disabled={
+                                busy === `${task.id}:dispatch` ||
+                                !canDispatchStatus(task.status)
+                              }
                               onClick={(event) => {
                                 event.stopPropagation();
                                 runAction(task, 'dispatch');
@@ -447,7 +469,10 @@ export default function Tasks() {
                               size="xs"
                               title={t('取消', 'Cancel')}
                               className="opacity-60 group-hover:opacity-100"
-                              disabled={busy === `${task.id}:cancel`}
+                              disabled={
+                                busy === `${task.id}:cancel` ||
+                                !canCancelStatus(task.status)
+                              }
                               onClick={(event) => {
                                 event.stopPropagation();
                                 runAction(task, 'cancel');
@@ -460,6 +485,10 @@ export default function Tasks() {
                               size="xs"
                               title={t('重置', 'Reset')}
                               className="opacity-60 group-hover:opacity-100"
+                              disabled={
+                                busy === `${task.id}:reset` ||
+                                !canResetStatus(task.status)
+                              }
                               onClick={(event) => {
                                 event.stopPropagation();
                                 runAction(task, 'reset');

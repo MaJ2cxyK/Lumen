@@ -10,7 +10,8 @@ import {
   X,
   type LucideIcon,
 } from 'lucide-react';
-import { AGENT_STATUS, RUN_STATUS, TASK_STATUS } from '../lib/labels';
+import { AGENT_STATUS, RUN_STATUS } from '../lib/labels';
+import { statusDescriptor } from '../lib/taskLifecycle';
 import { tr } from '../lib/i18n';
 
 export function cn(...inputs: ClassValue[]) {
@@ -116,7 +117,7 @@ export function Badge({
 }
 
 export function TaskStatusBadge({ status }: { status: string }) {
-  const meta = TASK_STATUS[status] ?? TASK_STATUS.inbox;
+  const meta = statusDescriptor(status);
   return (
     <span
       className="inline-flex items-center gap-1.5 rounded-md bg-soft px-1.5 py-0.5 text-xs font-medium text-muted"

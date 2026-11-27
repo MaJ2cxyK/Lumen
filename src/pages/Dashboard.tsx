@@ -17,7 +17,7 @@ import type { DashboardSummary, EventItem, AgentStat, Task } from '../lib/types'
 import { formatNumber, formatTokens, microsToUsd, fromNow } from '../lib/format';
 import { eventColor, eventLabel } from '../lib/labels';
 import { useI18n } from '../lib/i18n';
-import { isReviewPending, taskStage } from '../lib/taskStage';
+import { isReviewPending, statusDescriptor } from '../lib/taskLifecycle';
 import { TrendChart } from '../components/TrendChart';
 import {
   Button,
@@ -179,7 +179,7 @@ export default function Dashboard() {
               />
               <div className="divide-y divide-line/60">
                 {attention.slice(0, 5).map((task) => {
-                  const stage = taskStage(task.status);
+                  const status = statusDescriptor(task.status);
                   const review = isReviewPending(task);
                   return (
                     <Link
@@ -190,7 +190,7 @@ export default function Dashboard() {
                       <span
                         className={cn(
                           'h-1.5 w-1.5 shrink-0 rounded-full',
-                          review ? 'bg-warn' : stage.dot,
+                          review ? 'bg-warn' : status.dot,
                         )}
                       />
                       <span className="min-w-0 flex-1 truncate text-sm text-ink">
@@ -202,10 +202,10 @@ export default function Dashboard() {
                       <span
                         className={cn(
                           'shrink-0 text-xs font-medium',
-                          review ? 'text-warn' : stage.text,
+                          review ? 'text-warn' : status.text,
                         )}
                       >
-                        {review ? t('待审查', 'Review pending') : stage.label}
+                        {review ? t('待审查', 'Review pending') : status.label}
                       </span>
                       <ArrowRight size={12} className="shrink-0 text-muted group-hover:text-primary" />
                     </Link>

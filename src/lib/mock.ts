@@ -30,8 +30,19 @@ import type {
   UsagePoint,
   UsageSummary,
 } from './types';
-import { needsYouTask } from './taskStage';
-import { canReassignStatus, isActiveStatus } from './taskStatus';
+import {
+  canCancelStatus,
+  canChangeManualStatus,
+  canDispatchStatus,
+  canReassignStatus,
+  canResetStatus,
+  canResumeStatus,
+  canRetryStatus,
+  isActiveStatus,
+  isReviewLockedStatus,
+  isTaskStatus,
+  needsYouTask,
+} from './taskLifecycle';
 import { emitLocal } from './events';
 
 const demoLang = (() => {
@@ -1107,6 +1118,18 @@ function agentNameById(db: MockDB, id: string | null | undefined): string {
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Mirrors the backend review guard: unknown or active tasks fail closed. */
+function requireReviewIdle(task: Task | undefined): Task {
+  if (!task) throw new Error('任务不存在');
+  if (!isTaskStatus(task.status)) {
+    throw new Error('任务状态未知，请先重置后再操作隔离工作区');
+  }
+  if (isReviewLockedStatus(task.status)) {
+    throw new Error('任务正在运行，请先停止后再操作隔离工作区');
+  }
+  return task;
+}
+
 export async function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknown>): Promise<T> {
   await delay(50 + Math.random() * 90);
   const db = load();
@@ -1741,7 +1764,18 @@ export async function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknow
       if (patch.description != null) task.description = String(patch.description);
       if (patch.acceptance != null) task.acceptance = String(patch.acceptance);
       if (patch.priority != null) task.priority = Number(patch.priority);
-      if (patch.status != null) task.status = String(patch.status);
+      if (patch.status != null) {
+        const next = String(patch.status);
+        if (!isTaskStatus(next)) throw new Error(`未知任务状态「${next}」`);
+        if (!canChangeManualStatus(task.status, next)) {
+          throw new Error(
+            isActiveStatus(task.status)
+              ? '任务正在运行，请先停止后再修改状态'
+              : `不允许手动把任务状态改为「${next}」`,
+          );
+        }
+        task.status = next;
+      }
       if (patch.teamId != null) {
         const team = db.teams.find((t) => t.id === patch.teamId);
         task.teamId = team?.id ?? null;
@@ -1770,7 +1804,7 @@ export async function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknow
       const task = db.tasks.find((t) => t.id === args.taskId);
       if (!task) throw new Error('任务不存在');
       if (!task.teamId) throw new Error('请先为任务选择团队');
-      if (task.status === 'running' || task.status === 'waiting_approval') {
+      if (!canDispatchStatus(task.status)) {
         throw new Error('任务正在运行或等待审批，不能重复派发');
       }
       const restart = task.status === 'completed';
@@ -1787,6 +1821,9 @@ export async function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknow
     case 'task_cancel': {
       const task = db.tasks.find((t) => t.id === args.taskId);
       if (!task) throw new Error('任务不存在');
+      if (!canCancelStatus(task.status)) {
+        throw new Error('只有运行中、等待审批或已暂停的任务可以取消');
+      }
       db.runs.forEach((r) => {
         if (r.taskId === task.id && (r.status === 'running' || r.status === 'starting')) {
           r.status = 'cancelled';
@@ -1803,6 +1840,9 @@ export async function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknow
     case 'task_reset': {
       const task = db.tasks.find((t) => t.id === args.taskId);
       if (!task) throw new Error('任务不存在');
+      if (!canResetStatus(task.status)) {
+        throw new Error('任务正在运行，请先取消后再重置');
+      }
       task.status = 'inbox';
       task.stageIndex = 0;
       task.stageKey = null;
@@ -1835,7 +1875,7 @@ export async function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknow
     case 'task_resume': {
       const task = db.tasks.find((t) => t.id === args.taskId);
       if (!task) throw new Error('任务不存在');
-      if (task.status !== 'paused') throw new Error('只有已暂停的任务可以继续');
+      if (!canResumeStatus(task.status)) throw new Error('只有已暂停的任务可以继续');
       if (!task.teamId) throw new Error('请先为任务选择团队');
       task.status = 'queued';
       task.finishedAt = null;
@@ -1976,7 +2016,7 @@ export async function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknow
     case 'task_retry_stage': {
       const task = db.tasks.find((t) => t.id === args.taskId);
       if (!task) throw new Error('任务不存在');
-      if (task.status !== 'blocked') throw new Error('只有已阻塞的任务可以从当前阶段重试');
+      if (!canRetryStatus(task.status)) throw new Error('只有已阻塞的任务可以从当前阶段重试');
       if (!task.teamId) throw new Error('请先为任务选择团队');
       task.status = 'queued';
       task.finishedAt = null;
@@ -2040,31 +2080,29 @@ export async function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknow
     case 'task_review_revert': {
       const review = db.reviews.find((r) => r.taskId === args.taskId);
       if (!review) throw new Error('隔离工作区已不存在');
+      const task = requireReviewIdle(db.tasks.find((t) => t.id === args.taskId));
       review.files = review.files.filter((file) => file.path !== args.path);
-      const task = db.tasks.find((t) => t.id === args.taskId);
-      if (task) {
-        task.reviewPending = review.files.length > 0 || review.pendingCommits > 0;
-      }
+      task.reviewPending = review.files.length > 0 || review.pendingCommits > 0;
       save();
       return undefined as T;
     }
     case 'task_review_revert_all': {
       const review = db.reviews.find((r) => r.taskId === args.taskId);
       if (!review) throw new Error('隔离工作区已不存在');
+      const task = requireReviewIdle(db.tasks.find((t) => t.id === args.taskId));
       review.files = [];
-      const task = db.tasks.find((t) => t.id === args.taskId);
-      if (task) task.reviewPending = review.pendingCommits > 0;
+      task.reviewPending = review.pendingCommits > 0;
       save();
       return undefined as T;
     }
     case 'task_review_commit': {
       const review = db.reviews.find((r) => r.taskId === args.taskId);
       if (!review) throw new Error('隔离工作区已不存在');
+      const task = requireReviewIdle(db.tasks.find((t) => t.id === args.taskId));
       if (review.files.length === 0) throw new Error('没有可提交的改动');
       review.files = [];
       review.pendingCommits += 1;
-      const task = db.tasks.find((t) => t.id === args.taskId);
-      if (task) task.reviewPending = true;
+      task.reviewPending = true;
       save();
       trackEvent('task.reviewed', { pendingCommits: review.pendingCommits }, String(args.taskId));
       save();
@@ -2073,19 +2111,15 @@ export async function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknow
     case 'task_review_apply': {
       const review = db.reviews.find((r) => r.taskId === args.taskId);
       if (!review) throw new Error('隔离工作区已不存在');
+      const task = requireReviewIdle(db.tasks.find((t) => t.id === args.taskId));
       if (review.pendingCommits <= 0) throw new Error('没有待应用的提交');
       review.pendingCommits = 0;
-      const task = db.tasks.find((t) => t.id === args.taskId);
-      if (task) task.reviewPending = review.files.length > 0;
+      task.reviewPending = review.files.length > 0;
       save();
       return 'a991c3d' as T;
     }
     case 'task_review_cleanup': {
-      const task = db.tasks.find((t) => t.id === args.taskId);
-      if (!task) throw new Error('任务不存在');
-      if (isActiveStatus(task.status)) {
-        throw new Error('任务正在运行，请先停止后再操作隔离工作区');
-      }
+      const task = requireReviewIdle(db.tasks.find((t) => t.id === args.taskId));
       task.workDir = null;
       task.reviewPending = false;
       db.reviews = db.reviews.filter((r) => r.taskId !== task.id);

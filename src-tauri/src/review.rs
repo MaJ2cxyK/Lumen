@@ -1,5 +1,6 @@
 use crate::error::{AppError, Result};
 use crate::state::AppState;
+use crate::task_lifecycle::TaskStatus;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -145,13 +146,13 @@ fn task_ctx(state: &State<'_, AppState>, task_id: &str) -> Result<TaskCtx> {
 }
 
 fn ensure_idle(ctx: &TaskCtx) -> Result<()> {
-    if matches!(
-        ctx.status.as_str(),
-        "running" | "queued" | "waiting_approval"
-    ) {
-        return Err("任务正在运行，请先停止后再操作隔离工作区".into());
+    match TaskStatus::parse(&ctx.status) {
+        Some(status) if status.is_review_locked() => {
+            Err("任务正在运行，请先停止后再操作隔离工作区".into())
+        }
+        Some(_) => Ok(()),
+        None => Err("任务状态未知，请先重置任务后再操作隔离工作区".into()),
     }
-    Ok(())
 }
 
 fn active_work_dir(ctx: &TaskCtx) -> Result<PathBuf> {

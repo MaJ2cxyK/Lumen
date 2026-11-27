@@ -8,7 +8,7 @@ use rusqlite::{params, Connection};
 
 /// SQL literal for [`TaskStatus::is_active`]. Kept next to the enum so SQL and
 /// Rust guards move together; a test asserts the two agree.
-pub const ACTIVE_STATUSES_SQL: &str = "'queued','running','waiting_approval','paused_budget'";
+pub const ACTIVE_STATUSES_SQL: &str = "'queued','running','waiting_approval'";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
@@ -17,11 +17,9 @@ pub enum TaskStatus {
     Running,
     WaitingApproval,
     Paused,
-    PausedBudget,
     Blocked,
     Completed,
     Cancelled,
-    Failed,
 }
 
 impl TaskStatus {
@@ -32,11 +30,9 @@ impl TaskStatus {
             "running" => Self::Running,
             "waiting_approval" => Self::WaitingApproval,
             "paused" => Self::Paused,
-            "paused_budget" => Self::PausedBudget,
             "blocked" => Self::Blocked,
             "completed" => Self::Completed,
             "cancelled" => Self::Cancelled,
-            "failed" => Self::Failed,
             _ => return None,
         })
     }
@@ -48,20 +44,15 @@ impl TaskStatus {
             Self::Running => "running",
             Self::WaitingApproval => "waiting_approval",
             Self::Paused => "paused",
-            Self::PausedBudget => "paused_budget",
             Self::Blocked => "blocked",
             Self::Completed => "completed",
             Self::Cancelled => "cancelled",
-            Self::Failed => "failed",
         }
     }
 
     /// Statuses that own a live run slot or an in-flight pipeline.
     pub fn is_active(self) -> bool {
-        matches!(
-            self,
-            Self::Queued | Self::Running | Self::WaitingApproval | Self::PausedBudget
-        )
+        matches!(self, Self::Queued | Self::Running | Self::WaitingApproval)
     }
 
     /// Review actions must not race a stage that is still moving.
@@ -72,6 +63,12 @@ impl TaskStatus {
     /// Statuses a user may set directly from the task edit form.
     pub fn manual_targets() -> &'static [TaskStatus] {
         &[Self::Inbox, Self::Blocked, Self::Completed, Self::Cancelled]
+    }
+
+    /// Manual status edits never race a live run, and unknown target values
+    /// are rejected by [`TaskStatus::parse`] before this predicate runs.
+    pub fn can_change_manual(from: TaskStatus, to: TaskStatus) -> bool {
+        !from.is_active() && Self::manual_targets().contains(&to)
     }
 }
 
@@ -109,7 +106,6 @@ pub enum TaskTransition<'a> {
         stage: Option<i64>,
         result_json: &'a str,
     },
-    BudgetPause,
     StartupReconcile,
     Manual {
         status: TaskStatus,
@@ -155,11 +151,8 @@ pub fn permits(from: TaskStatus, transition: TaskTransition<'_>) -> bool {
             from,
             TaskStatus::Queued | TaskStatus::Running | TaskStatus::WaitingApproval
         ),
-        TaskTransition::BudgetPause => {
-            matches!(from, TaskStatus::Queued | TaskStatus::Running)
-        }
         TaskTransition::StartupReconcile => from.is_active(),
-        TaskTransition::Manual { status } => TaskStatus::manual_targets().contains(&status),
+        TaskTransition::Manual { status } => TaskStatus::can_change_manual(from, status),
     }
 }
 
@@ -182,8 +175,30 @@ pub fn apply(
             |r| r.get(0),
         )
         .map_err(|_| AppError::Msg("任务不存在".into()))?;
-    let status = TaskStatus::parse(&current)
-        .ok_or_else(|| AppError::Msg(format!("未知任务状态「{current}」")))?;
+    let status = match TaskStatus::parse(&current) {
+        Some(status) => status,
+        // Unknown persisted values have exactly one repair path: an explicit
+        // compare-and-swap reset back to inbox. Every other transition fails
+        // closed below.
+        None if matches!(transition, TaskTransition::Reset) => {
+            let changed = conn.execute(
+                "UPDATE tasks SET status = 'inbox', stage_index = 0, stage_key = NULL,
+                        started_at = NULL, finished_at = NULL
+                 WHERE id = ?1 AND status = ?2",
+                params![task_id, current],
+            )?;
+            let expired = if changed > 0 {
+                crate::approval::expire_pending_for_task(conn, task_id, expiry_note)?
+            } else {
+                0
+            };
+            return Ok(TransitionOutcome {
+                changed: changed > 0,
+                expired,
+            });
+        }
+        None => return Err(AppError::Msg(format!("未知任务状态「{current}」"))),
+    };
     if !permits(status, transition) {
         return Ok(TransitionOutcome {
             changed: false,
@@ -263,10 +278,6 @@ pub fn apply(
                 params![crate::db::now_ms(), result_json, task_id, current],
             )?,
         },
-        TaskTransition::BudgetPause => conn.execute(
-            "UPDATE tasks SET status = 'paused_budget' WHERE id = ?1 AND status = ?2",
-            params![task_id, current],
-        )?,
         TaskTransition::Manual { status } => conn.execute(
             "UPDATE tasks SET status = ?1,
                     finished_at = CASE WHEN ?1 = 'completed'
@@ -378,6 +389,16 @@ mod tests {
                 status: TaskStatus::Running
             }
         ));
+        assert!(!permits(
+            TaskStatus::Running,
+            TaskTransition::Manual {
+                status: TaskStatus::Completed
+            }
+        ));
+        assert!(TaskStatus::can_change_manual(
+            TaskStatus::Paused,
+            TaskStatus::Inbox
+        ));
     }
 
     #[test]
@@ -388,11 +409,9 @@ mod tests {
             TaskStatus::Running,
             TaskStatus::WaitingApproval,
             TaskStatus::Paused,
-            TaskStatus::PausedBudget,
             TaskStatus::Blocked,
             TaskStatus::Completed,
             TaskStatus::Cancelled,
-            TaskStatus::Failed,
         ];
         let expected = all
             .iter()
@@ -429,6 +448,53 @@ mod tests {
             "t1",
             TaskTransition::Dispatch { start_stage: 0 },
             "dispatch",
+        )
+        .unwrap();
+        assert!(!outcome.changed);
+        assert_eq!(status_of(&conn, "t1").0, "running");
+    }
+
+    #[test]
+    fn unknown_status_can_only_be_repaired_by_reset() {
+        let conn = test_connection();
+        seed_task(&conn, "t1", "legacy_value");
+        pending_approval(&conn, "t1");
+
+        let manual = apply(
+            &conn,
+            "t1",
+            TaskTransition::Manual {
+                status: TaskStatus::Completed,
+            },
+            "manual",
+        );
+        assert!(manual.is_err());
+        let dispatch = apply(
+            &conn,
+            "t1",
+            TaskTransition::Dispatch { start_stage: 0 },
+            "dispatch",
+        );
+        assert!(dispatch.is_err());
+        assert_eq!(status_of(&conn, "t1").0, "legacy_value");
+
+        let outcome = apply(&conn, "t1", TaskTransition::Reset, "reset").unwrap();
+        assert!(outcome.changed);
+        assert_eq!(outcome.expired, 1);
+        assert_eq!(status_of(&conn, "t1"), ("inbox".to_string(), 0));
+    }
+
+    #[test]
+    fn manual_status_change_is_rejected_while_a_run_is_live() {
+        let conn = test_connection();
+        seed_task(&conn, "t1", "running");
+        let outcome = apply(
+            &conn,
+            "t1",
+            TaskTransition::Manual {
+                status: TaskStatus::Completed,
+            },
+            "manual",
         )
         .unwrap();
         assert!(!outcome.changed);

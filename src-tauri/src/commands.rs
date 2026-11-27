@@ -736,7 +736,7 @@ fn query_tasks_page(
     }
     if attention_only.unwrap_or(false) {
         filter.push_str(&format!(
-            " AND (t.status IN ('inbox', 'waiting_approval', 'blocked')
+            " AND (t.status IN ('inbox', 'waiting_approval', 'paused', 'blocked')
                    OR (t.review_pending = 1 AND t.status NOT IN ({})))",
             task_lifecycle::ACTIVE_STATUSES_SQL
         ));
@@ -911,6 +911,33 @@ mod tests {
         assert_eq!(attention.total, 4);
         assert_eq!(attention.status_counts.get("inbox"), Some(&3));
         assert_eq!(attention.review_count, 0);
+    }
+
+    #[test]
+    fn attention_includes_paused_and_inactive_review_but_not_active_review() {
+        let conn = seed_tasks();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, description, status, priority, created_at)
+             VALUES ('t6', 'p1', '六', 'f', 'paused', 3, 60),
+                    ('t7', 'p1', '七', 'g', 'running', 3, 50)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET review_pending = 1 WHERE id IN ('t4', 't7')",
+            [],
+        )
+        .unwrap();
+
+        let attention =
+            query_tasks_page(&conn, None, None, None, Some(true), None, Some(10)).unwrap();
+        assert_eq!(attention.total, 6);
+        assert_eq!(attention.status_counts.get("inbox"), Some(&3));
+        assert_eq!(attention.status_counts.get("blocked"), Some(&1));
+        assert_eq!(attention.status_counts.get("paused"), Some(&1));
+        assert_eq!(attention.status_counts.get("completed"), Some(&1));
+        assert_eq!(attention.status_counts.get("running"), None);
+        assert_eq!(attention.review_count, 1);
     }
 }
 
@@ -1404,16 +1431,8 @@ pub fn task_update(
     id: String,
     patch: TaskPatch,
 ) -> Result<()> {
-    if let Some(status) = patch.status.as_deref() {
-        let allowed = TaskStatus::parse(status)
-            .map(|value| TaskStatus::manual_targets().contains(&value))
-            .unwrap_or(false);
-        if !allowed {
-            return Err(format!("不允许手动把任务状态改为「{status}」").into());
-        }
-    }
     let conn = conn(&state)?;
-    let (title, description, acceptance, priority, status): (
+    let (title, description, acceptance, priority, current_status): (
         String,
         Option<String>,
         Option<String>,
@@ -1424,8 +1443,25 @@ pub fn task_update(
         params![id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     )?;
+    if let Some(status) = patch.status.as_deref() {
+        let from = TaskStatus::parse(&current_status).ok_or_else(|| {
+            AppError::Msg(format!("未知任务状态「{current_status}」，请先重置任务"))
+        })?;
+        let to = TaskStatus::parse(status)
+            .ok_or_else(|| AppError::Msg(format!("不允许手动把任务状态改为「{status}」")))?;
+        if !TaskStatus::can_change_manual(from, to) {
+            return Err(if from.is_active() {
+                "任务正在运行，请先停止后再修改状态".into()
+            } else {
+                format!("不允许手动把任务状态改为「{status}」").into()
+            });
+        }
+    }
     let status_changed = patch.status.is_some();
-    let next_status = patch.status.clone().unwrap_or_else(|| status.clone());
+    let next_status = patch
+        .status
+        .clone()
+        .unwrap_or_else(|| current_status.clone());
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "UPDATE tasks SET title = ?1, description = ?2, acceptance = ?3, priority = ?4,
@@ -1444,13 +1480,16 @@ pub fn task_update(
         Some(status) => {
             let next = TaskStatus::parse(status)
                 .ok_or_else(|| AppError::Msg(format!("未知任务状态「{status}」")))?;
-            task_lifecycle::apply(
+            let outcome = task_lifecycle::apply(
                 &tx,
                 &id,
                 TaskTransition::Manual { status: next },
                 "任务状态已手动变更",
-            )?
-            .expired
+            )?;
+            if !outcome.changed {
+                return Err("任务状态已变化，请刷新后重试".into());
+            }
+            outcome.expired
         }
         None => 0,
     };
@@ -2009,10 +2048,11 @@ pub fn task_reset(app: AppHandle, state: State<'_, AppState>, task_id: String) -
             |r| r.get(0),
         )
         .map_err(|_| AppError::Msg("任务不存在".into()))?;
-    let status_kind = TaskStatus::parse(&status)
-        .ok_or_else(|| AppError::Msg(format!("未知任务状态「{status}」")))?;
-    if !task_lifecycle::permits(status_kind, TaskTransition::Reset) {
-        return Err("任务正在运行，请先取消后再重置".into());
+    // Unknown persisted values are repairable only through this reset path.
+    if let Some(status_kind) = TaskStatus::parse(&status) {
+        if !task_lifecycle::permits(status_kind, TaskTransition::Reset) {
+            return Err("任务正在运行，请先取消后再重置".into());
+        }
     }
     let tx = conn.unchecked_transaction()?;
     let outcome = task_lifecycle::apply(&tx, &task_id, TaskTransition::Reset, "任务已重置")?;

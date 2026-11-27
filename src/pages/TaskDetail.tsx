@@ -50,16 +50,17 @@ import type {
   ToolCall,
 } from '../lib/types';
 import { priorityMeta, roleName } from '../lib/labels';
-import { taskStage } from '../lib/taskStage';
 import {
   canCancelStatus,
   canDispatchStatus,
   canPauseStatus,
   canReassignStatus,
+  canResetStatus,
   canResumeStatus,
   isActiveStatus,
   isReviewLockedStatus,
-} from '../lib/taskStatus';
+  statusDescriptor,
+} from '../lib/taskLifecycle';
 import { useAppStore } from '../store';
 import {
   formatBytes,
@@ -1013,7 +1014,8 @@ export default function TaskDetail() {
     );
   }
 
-  const stage = taskStage(task.status);
+  const status = statusDescriptor(task.status);
+  const closed = status.stage === 'closed';
   const currentIndex = task.stageIndex;
   const canResume = canResumeStatus(task.status);
   const canDispatch = Boolean(task.teamId) && canDispatchStatus(task.status);
@@ -1021,6 +1023,7 @@ export default function TaskDetail() {
   const canCancel = canCancelStatus(task.status);
   const canReassign = canReassignStatus(task.status) && seats.length > 0;
   const reviewLocked = isReviewLockedStatus(task.status);
+  const canReset = task.status !== 'inbox' && canResetStatus(task.status);
 
   return (
     <div className="h-full overflow-hidden">
@@ -1031,8 +1034,8 @@ export default function TaskDetail() {
             <span className="flex items-center gap-2">
               {task.title}
               <Badge>
-                <span className={cn('h-1.5 w-1.5 rounded-full', stage.dot)} />
-                {stage.label}
+                <span className={cn('h-1.5 w-1.5 rounded-full', status.dot)} />
+                {status.label}
               </Badge>
             </span>
           }
@@ -1054,7 +1057,7 @@ export default function TaskDetail() {
                 <span className={cn('h-1.5 w-1.5 rounded-full', priorityMeta(task.priority).dot)} />
                 {priorityMeta(task.priority).label}
               </Badge>
-              <span className={cn('text-xs', stage.text)}>{stage.hint}</span>
+              <span className={cn('text-xs', status.text)}>{status.hint}</span>
               <span className="font-mono text-xs text-muted/60">{task.id.slice(-6)}</span>
             </span>
           }
@@ -1116,7 +1119,7 @@ export default function TaskDetail() {
               <Button
                 variant="ghost"
                 size="sm"
-                disabled={task.status === 'inbox'}
+                disabled={!canReset}
                 loading={busy === 'reset'}
                 onClick={() => action('reset')}
               >
@@ -1138,8 +1141,8 @@ export default function TaskDetail() {
           ) : (
             <div className="flex min-w-max items-start">
               {seats.map((seat, index) => {
-                const done = task.status === 'completed' || index < currentIndex;
-                const current = index === currentIndex && task.status !== 'completed';
+                const done = closed || index < currentIndex;
+                const current = !closed && index === currentIndex;
                 const blocked = current && task.status === 'blocked';
                 return (
                   <div key={seat.id} className="flex items-center">
@@ -1498,7 +1501,7 @@ export default function TaskDetail() {
                   ) : (
                     <div className="mt-1.5 space-y-1">
                       {children.map((child) => {
-                        const childStage = taskStage(child.status);
+                        const childStatus = statusDescriptor(child.status);
                         return (
                           <Link
                             key={child.id}
@@ -1509,11 +1512,11 @@ export default function TaskDetail() {
                             <span
                               className={cn(
                                 'shrink-0 rounded px-1.5 py-0.5 text-[10px]',
-                                childStage.bg,
-                                childStage.text,
+                                childStatus.bg,
+                                childStatus.text,
                               )}
                             >
-                              {childStage.label}
+                              {childStatus.label}
                             </span>
                           </Link>
                         );
@@ -1534,7 +1537,7 @@ export default function TaskDetail() {
                   ) : (
                     <div className="mt-1.5 space-y-1">
                       {deps.map((dep) => {
-                        const depStage = taskStage(dep.status);
+                        const depStatus = statusDescriptor(dep.status);
                         return (
                           <div
                             key={dep.dependsOnId}
@@ -1547,8 +1550,8 @@ export default function TaskDetail() {
                               {dep.title}
                             </Link>
                             <span className="flex shrink-0 items-center gap-1.5">
-                              <span className={cn('text-[10px]', depStage.text)}>
-                                {depStage.label}
+                              <span className={cn('text-[10px]', depStatus.text)}>
+                                {depStatus.label}
                               </span>
                               <button
                                 type="button"
