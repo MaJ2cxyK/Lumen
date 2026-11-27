@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+mod policy;
+
 #[cfg(windows)]
 use crate::sandbox::session::SandboxSession;
 /// 非 Windows 平台不提供 AppContainer，仅用于保持类型可编译。
@@ -1278,29 +1280,15 @@ pub async fn execute(
     }
 
     let cancelled_now = cancelled.load(Ordering::SeqCst);
-    let (run_status, error) = if budget_blocked {
-        (
-            "paused_budget",
-            Some("预算达到上限，运行已暂停".to_string()),
-        )
-    } else if hook_bypass && settings.hook_strict {
-        (
-            "failed",
-            Some("检测到未经审批网关的工具调用，严格模式判定失败".to_string()),
-        )
-    } else if cancelled_now {
-        ("cancelled", None)
-    } else if exit_code == 0 && outcome.error.is_none() {
-        ("completed", None)
-    } else {
-        (
-            "failed",
-            outcome
-                .error
-                .clone()
-                .or_else(|| Some(format!("Agent 退出码 {exit_code}"))),
-        )
-    };
+    let (run_status, error) = policy::evaluate(policy::OutcomeInputs {
+        budget_blocked,
+        hook_bypass,
+        hook_strict: settings.hook_strict,
+        cancelled: cancelled_now,
+        exit_code,
+        reported_error: outcome.error.as_deref(),
+    });
+    let run_status = run_status.as_db_str();
     outcome.success = run_status == "completed";
     if outcome.error.is_none() {
         outcome.error = error.clone();
