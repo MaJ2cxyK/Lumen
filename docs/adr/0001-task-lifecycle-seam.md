@@ -23,8 +23,9 @@ review locking each had a slightly different idea of which statuses were
 - `ACTIVE_STATUSES_SQL` mirrors `is_active` for the few queries that must
   filter in SQL; a unit test keeps the two in sync.
 
-The frontend mirrors the same guards in `src/lib/taskStatus.ts` so buttons and
-backend enforcement cannot disagree.
+The frontend mirrors the same guards in `src/lib/taskLifecycle.ts` so buttons,
+board stages, and backend enforcement cannot disagree. ADR-0002 narrows the
+task-status vocabulary and defines the unknown-status repair path.
 
 ## Consequences
 

@@ -110,7 +110,7 @@ Tauri commands（src-tauri/src/commands.rs，约 100 个命令）
 | `src/pages/` | 总览、项目、任务、审批、历史、用量、预算、设置等页面 |
 | `src/lib/api.ts` | Tauri invoke / event 的统一封装 |
 | `src/lib/mock.ts` | 浏览器预览用的后端模拟，约 2400 行 |
-| `src/lib/taskStage.ts` | “任务阶段 / 在等谁 / 是否需要你”的派生规则 |
+| `src/lib/taskLifecycle.ts` | 持久化任务状态、派生看板阶段、注意力规则与共享动作守卫 |
 | `src-tauri/src/commands.rs` | Tauri 命令入口与大部分 SQL 编排 |
 | `src-tauri/src/orchestrator.rs` | 团队席位顺序、阶段门禁、派发与恢复 |
 | `src-tauri/src/runtime.rs` | CLI 子进程、stream-json、用量、取消与超时 |

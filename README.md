@@ -110,7 +110,7 @@ Tauri commands (src-tauri/src/commands.rs, ~100 commands)
 | `src/pages/` | Dashboard, projects, tasks, approvals, history, usage, budgets, settings |
 | `src/lib/api.ts` | Unified Tauri invoke / event wrapper |
 | `src/lib/mock.ts` | Backend mock for browser preview (~2,400 lines) |
-| `src/lib/taskStage.ts` | Derived rules for task stage / who it waits on / whether it needs you |
+| `src/lib/taskLifecycle.ts` | Persisted task status, derived board stage, attention rules, and shared action guards |
 | `src-tauri/src/commands.rs` | Tauri command entry points and most SQL orchestration |
 | `src-tauri/src/orchestrator.rs` | Seat ordering, stage gates, dispatch, resume |
 | `src-tauri/src/runtime.rs` | CLI subprocesses, stream-json, usage, cancel, timeouts |
