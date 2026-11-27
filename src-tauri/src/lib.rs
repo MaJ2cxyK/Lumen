@@ -31,6 +31,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
+/// Unit-test binaries link rfd (through the dialog plugin), which imports
+/// `TaskDialogIndirect` from Common Controls v6. Rust's MSVC link line does not
+/// embed an application manifest, so the loader binds comctl32 v5 and aborts
+/// with `STATUS_ENTRYPOINT_NOT_FOUND`. `build.rs` writes a manifest dependency
+/// directive that link.exe reads from this section in test builds only.
+#[cfg(all(test, target_os = "windows"))]
+#[used]
+#[link_section = ".drectve"]
+static TEST_MANIFEST_DEPENDENCY: [u8; include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/test-manifest.drectve"
+))
+.len()] = *include_bytes!(concat!(env!("OUT_DIR"), "/test-manifest.drectve"));
+
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
