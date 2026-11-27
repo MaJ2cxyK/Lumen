@@ -19,9 +19,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 mod events;
 mod policy;
 mod store;
+mod stream;
 
 use events::{RunEvents, TauriEvents};
 use store::{FinishRecord, MessageRecord, RunStore};
+use stream::{MessageOrigin, RunEffect, StreamInterpreter, UsageDelta};
 
 #[cfg(windows)]
 use crate::sandbox::session::SandboxSession;
@@ -242,21 +244,214 @@ fn hash_line(line: &str) -> String {
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
-fn text_of_content(content: &Value) -> String {
-    if let Some(text) = content.as_str() {
-        return text.to_string();
+fn usage_input(req: &RunRequest, delta: &UsageDelta) -> UsageInput {
+    UsageInput {
+        run_id: Some(req.run_id.clone()),
+        task_id: Some(req.task_id.clone()),
+        project_id: Some(req.project_id.clone()),
+        team_id: Some(req.team_id.clone()),
+        seat_id: req.seat_id.clone(),
+        agent_id: Some(req.agent_id.clone()),
+        provider: crate::usage::provider_for(&delta.model),
+        model: delta.model.clone(),
+        input_tokens: delta.input_tokens,
+        output_tokens: delta.output_tokens,
+        cache_read_tokens: delta.cache_read_tokens,
+        cache_write_tokens: delta.cache_write_tokens,
+        source: delta.source.to_string(),
+        dedupe_key: delta.dedupe_key.clone(),
     }
-    let mut parts = Vec::new();
-    if let Some(arr) = content.as_array() {
-        for block in arr {
-            if block.get("type").and_then(|v| v.as_str()) == Some("text") {
-                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                    parts.push(text.to_string());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_run_effect(
+    effect: RunEffect,
+    req: &RunRequest,
+    store: &RunStore,
+    events: &dyn RunEvents,
+    app: &AppHandle,
+    db: &Db,
+    settings: &AppSettings,
+    registry: &Arc<RunRegistry>,
+    outcome: &mut RunOutcome,
+    usage_recorded: &mut bool,
+    gated_calls: &mut Vec<(String, String)>,
+    budget_blocked: &mut bool,
+) {
+    match effect {
+        RunEffect::SessionObserved { session_id } => {
+            outcome.session_id = Some(session_id.clone());
+            store.set_session(&req.run_id, &session_id);
+        }
+        RunEffect::ChatMessage {
+            model,
+            text,
+            origin,
+        } => {
+            let meta = match origin {
+                MessageOrigin::Claude => json!({
+                    "model": model,
+                    "sessionId": outcome.session_id.as_deref()
+                }),
+                MessageOrigin::Stdout => json!({ "source": "stdout" }),
+            };
+            if let Ok(msg_id) = store.insert_message(MessageRecord {
+                task_id: &req.task_id,
+                run_id: &req.run_id,
+                seat_id: req.seat_id.as_deref(),
+                agent_id: &req.agent_id,
+                kind: "chat",
+                role: Some("assistant"),
+                content: &text,
+                meta,
+            }) {
+                if matches!(origin, MessageOrigin::Claude) {
+                    store.record_event(
+                        req,
+                        "agent.message",
+                        Some(&req.agent_name),
+                        json!({ "messageId": msg_id, "chars": text.chars().count() }),
+                    );
+                }
+                let payload = match origin {
+                    MessageOrigin::Claude => json!({
+                        "runId": req.run_id,
+                        "kind": "message",
+                        "message": {
+                            "id": msg_id,
+                            "taskId": req.task_id,
+                            "runId": req.run_id,
+                            "seatId": req.seat_id,
+                            "agentId": req.agent_id,
+                            "kind": "chat",
+                            "role": "assistant",
+                            "content": text,
+                            "sessionId": outcome.session_id.as_deref(),
+                            "createdAt": now_ms()
+                        }
+                    }),
+                    MessageOrigin::Stdout => json!({
+                        "runId": req.run_id,
+                        "kind": "message",
+                        "message": {
+                            "taskId": req.task_id,
+                            "runId": req.run_id,
+                            "seatId": req.seat_id,
+                            "agentId": req.agent_id,
+                            "kind": "chat",
+                            "role": "assistant",
+                            "content": text,
+                            "createdAt": now_ms()
+                        }
+                    }),
+                };
+                events.emit("run.delta", payload);
+                if matches!(origin, MessageOrigin::Stdout) && outcome.final_text.is_empty() {
+                    outcome.final_text = text.clone();
+                }
+            }
+        }
+        RunEffect::ToolCall {
+            tool_id,
+            tool_name,
+            input,
+            gated,
+        } => {
+            if gated {
+                gated_calls.push((tool_name.clone(), crate::approval::input_hash(&input)));
+            }
+            let call_id = format!("{}:{}", req.run_id, tool_id);
+            store.insert_tool_call(&call_id, &req.run_id, &tool_name, &input);
+            events.emit(
+                "run.delta",
+                json!({
+                    "runId": req.run_id,
+                    "kind": "tool_call",
+                    "toolCall": {
+                        "id": call_id,
+                        "toolName": tool_name,
+                        "input": input,
+                        "status": "running"
+                    }
+                }),
+            );
+        }
+        RunEffect::ToolResult { tool_id, output } => {
+            let call_id = format!("{}:{}", req.run_id, tool_id);
+            store.complete_tool_call(&call_id, &output);
+            events.emit(
+                "run.delta",
+                json!({
+                    "runId": req.run_id,
+                    "kind": "tool_result",
+                    "toolCallId": call_id
+                }),
+            );
+        }
+        RunEffect::Usage(delta) => {
+            let input = usage_input(req, &delta);
+            if let Ok(conn) = db.open() {
+                if let Some(cost) = store.record_usage_on(&conn, &input) {
+                    if delta.report_delta {
+                        *usage_recorded = true;
+                    }
+                    if delta.report_updated {
+                        events.emit("usage.updated", json!({ "runId": req.run_id }));
+                    }
+                    if delta.report_alert {
+                        *budget_blocked |=
+                            handle_alerts(app, &conn, req, registry, settings.notify);
+                    }
+                    if delta.report_delta {
+                        events.emit(
+                            "run.delta",
+                            json!({
+                                "runId": req.run_id,
+                                "kind": "usage",
+                                "usage": {
+                                    "inputTokens": delta.input_tokens,
+                                    "outputTokens": delta.output_tokens,
+                                    "cacheReadTokens": delta.cache_read_tokens,
+                                    "cacheWriteTokens": delta.cache_write_tokens,
+                                    "costMicros": cost
+                                }
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+        RunEffect::RawLine { line } => {
+            events.emit(
+                "run.delta",
+                json!({ "runId": req.run_id, "kind": "raw", "line": line }),
+            );
+        }
+        RunEffect::Result {
+            final_text,
+            session_id,
+            error,
+            fallback_usage,
+        } => {
+            if let Some(text) = final_text {
+                outcome.final_text = text;
+            }
+            if let Some(session_id) = session_id {
+                outcome.session_id = Some(session_id);
+            }
+            if let Some(error) = error {
+                outcome.error = Some(error);
+            }
+            if let Some(delta) = fallback_usage {
+                if !*usage_recorded {
+                    let input = usage_input(req, &delta);
+                    if let Ok(conn) = db.open() {
+                        let _ = store.record_usage_on(&conn, &input);
+                    }
                 }
             }
         }
     }
-    parts.join("\n")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -697,14 +892,17 @@ pub async fn execute(
     }
 
     let mut outcome = RunOutcome::default();
-    let mut recorded_any = false;
+    let mut usage_recorded = false;
     let mut budget_blocked = false;
-    let mut generic_output = String::new();
     // 记录流里出现过的受管工具调用，运行结束时与网关日志比对，识别 hook 绕过。
     let mut gated_calls: Vec<(String, String)> = Vec::new();
-    let mut est_input_recorded = false;
-    let mut est_output_recorded: i64 = 0;
-    let mut est_bytes: usize = 0;
+    let mut interpreter = StreamInterpreter::new(
+        &req.adapter,
+        &req.run_id,
+        &req.model,
+        &req.prompt,
+        use_proxy,
+    );
 
     if let Some(stdout) = child.stdout.take() {
         let mut lines = BufReader::new(stdout).lines();
@@ -713,336 +911,40 @@ pub async fn execute(
             if line.trim().is_empty() {
                 continue;
             }
-            if is_claude {
-                let parsed: Value = match serde_json::from_str(&line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let kind = parsed
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                match kind {
-                    "system" => {
-                        if let Some(sid) = parsed.get("session_id").and_then(|v| v.as_str()) {
-                            outcome.session_id = Some(sid.to_string());
-                            store.set_session(&req.run_id, sid);
-                        }
-                    }
-                    "assistant" => {
-                        let Some(message) = parsed.get("message") else {
-                            continue;
-                        };
-                        let model = message
-                            .get("model")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(&req.model)
-                            .to_string();
-                        let content = message.get("content").cloned().unwrap_or(Value::Null);
-                        let text = text_of_content(&content);
-                        if !text.trim().is_empty() {
-                            if let Ok(msg_id) = store.insert_message(MessageRecord {
-                                task_id: &req.task_id,
-                                run_id: &req.run_id,
-                                seat_id: req.seat_id.as_deref(),
-                                agent_id: &req.agent_id,
-                                kind: "chat",
-                                role: Some("assistant"),
-                                content: &text,
-                                meta: json!({ "model": model, "sessionId": outcome.session_id }),
-                            }) {
-                                store.record_event(
-                                    &req,
-                                    "agent.message",
-                                    Some(&req.agent_name),
-                                    json!({ "messageId": msg_id, "chars": text.chars().count() }),
-                                );
-                                events.emit(
-                                    "run.delta",
-                                    json!({
-                                        "runId": req.run_id,
-                                        "kind": "message",
-                                        "message": {
-                                            "id": msg_id,
-                                            "taskId": req.task_id,
-                                            "runId": req.run_id,
-                                            "seatId": req.seat_id,
-                                            "agentId": req.agent_id,
-                                            "kind": "chat",
-                                            "role": "assistant",
-                                            "content": text,
-                                            "sessionId": outcome.session_id,
-                                            "createdAt": now_ms()
-                                        }
-                                    }),
-                                );
-                            }
-                        }
-                        if let Some(blocks) = content.as_array() {
-                            for block in blocks {
-                                if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                                    let tool_name = block
-                                        .get("name")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("tool");
-                                    let tool_id = block
-                                        .get("id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or_default();
-                                    let input = block.get("input").cloned().unwrap_or(Value::Null);
-                                    if gate_tool_matched(tool_name) {
-                                        gated_calls.push((
-                                            tool_name.to_string(),
-                                            crate::approval::input_hash(&input),
-                                        ));
-                                    }
-                                    let call_id = format!("{}:{}", req.run_id, tool_id);
-                                    store.insert_tool_call(
-                                        &call_id,
-                                        &req.run_id,
-                                        tool_name,
-                                        &input,
-                                    );
-                                    events.emit(
-                                        "run.delta",
-                                        json!({
-                                            "runId": req.run_id,
-                                            "kind": "tool_call",
-                                            "toolCall": {
-                                                "id": call_id,
-                                                "toolName": tool_name,
-                                                "input": input,
-                                                "status": "running"
-                                            }
-                                        }),
-                                    );
-                                }
-                            }
-                        }
-                        if !use_proxy {
-                            if let Some(usage) = message.get("usage") {
-                                let input_tokens = usage
-                                    .get("input_tokens")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0);
-                                let output_tokens = usage
-                                    .get("output_tokens")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0);
-                                let cache_read = usage
-                                    .get("cache_read_input_tokens")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0);
-                                let cache_write = usage
-                                    .get("cache_creation_input_tokens")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0);
-                                let message_id = message
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_else(|| hash_line(&line));
-                                if let Ok(conn) = db.open() {
-                                    let input = UsageInput {
-                                        run_id: Some(req.run_id.clone()),
-                                        task_id: Some(req.task_id.clone()),
-                                        project_id: Some(req.project_id.clone()),
-                                        team_id: Some(req.team_id.clone()),
-                                        seat_id: req.seat_id.clone(),
-                                        agent_id: Some(req.agent_id.clone()),
-                                        provider: crate::usage::provider_for(&model),
-                                        model: model.clone(),
-                                        input_tokens,
-                                        output_tokens,
-                                        cache_read_tokens: cache_read,
-                                        cache_write_tokens: cache_write,
-                                        source: "stream".into(),
-                                        dedupe_key: format!("claude:{}:{}", req.run_id, message_id),
-                                    };
-                                    if let Some(cost) = store.record_usage_on(&conn, &input) {
-                                        recorded_any = true;
-                                        events
-                                            .emit("usage.updated", json!({ "runId": req.run_id }));
-                                        budget_blocked |= handle_alerts(
-                                            app,
-                                            &conn,
-                                            &req,
-                                            registry,
-                                            settings.notify,
-                                        );
-                                        events.emit(
-                                            "run.delta",
-                                            json!({
-                                                "runId": req.run_id,
-                                                "kind": "usage",
-                                                "usage": {
-                                                    "inputTokens": input_tokens,
-                                                    "outputTokens": output_tokens,
-                                                    "cacheReadTokens": cache_read,
-                                                    "cacheWriteTokens": cache_write,
-                                                    "costMicros": cost
-                                                }
-                                            }),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    "user" => {
-                        if let Some(message) = parsed.get("message") {
-                            if let Some(blocks) = message.get("content").and_then(|v| v.as_array())
-                            {
-                                for block in blocks {
-                                    if block.get("type").and_then(|v| v.as_str())
-                                        == Some("tool_result")
-                                    {
-                                        let tool_id = block
-                                            .get("tool_use_id")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or_default();
-                                        let call_id = format!("{}:{}", req.run_id, tool_id);
-                                        let output =
-                                            block.get("content").cloned().unwrap_or(Value::Null);
-                                        store.complete_tool_call(&call_id, &output);
-                                        events.emit(
-                                            "run.delta",
-                                            json!({ "runId": req.run_id, "kind": "tool_result", "toolCallId": call_id }),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    "result" => {
-                        if let Some(result) = parsed.get("result").and_then(|v| v.as_str()) {
-                            if !result.trim().is_empty() {
-                                outcome.final_text = result.to_string();
-                            }
-                        }
-                        if let Some(sid) = parsed.get("session_id").and_then(|v| v.as_str()) {
-                            outcome.session_id = Some(sid.to_string());
-                        }
-                        let is_error = parsed
-                            .get("is_error")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        if is_error {
-                            outcome.error = parsed
-                                .get("result")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                                .or_else(|| Some("Agent 返回错误".into()));
-                        }
-                        if !recorded_any && !use_proxy {
-                            if let Some(usage) = parsed.get("usage") {
-                                let input_tokens = usage
-                                    .get("input_tokens")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0);
-                                let output_tokens = usage
-                                    .get("output_tokens")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0);
-                                let cache_read = usage
-                                    .get("cache_read_input_tokens")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0);
-                                let cache_write = usage
-                                    .get("cache_creation_input_tokens")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0);
-                                if let Ok(conn) = db.open() {
-                                    let model = parsed
-                                        .get("modelUsage")
-                                        .and_then(|v| v.as_object())
-                                        .and_then(|m| m.keys().next().cloned())
-                                        .unwrap_or_else(|| req.model.clone());
-                                    let input = UsageInput {
-                                        run_id: Some(req.run_id.clone()),
-                                        task_id: Some(req.task_id.clone()),
-                                        project_id: Some(req.project_id.clone()),
-                                        team_id: Some(req.team_id.clone()),
-                                        seat_id: req.seat_id.clone(),
-                                        agent_id: Some(req.agent_id.clone()),
-                                        provider: crate::usage::provider_for(&model),
-                                        model,
-                                        input_tokens,
-                                        output_tokens,
-                                        cache_read_tokens: cache_read,
-                                        cache_write_tokens: cache_write,
-                                        source: "stream".into(),
-                                        dedupe_key: format!("claude:{}:result", req.run_id),
-                                    };
-                                    let _ = store.record_usage_on(&conn, &input);
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            } else {
-                generic_output.push_str(&line);
-                generic_output.push('\n');
-                events.emit(
-                    "run.delta",
-                    json!({ "runId": req.run_id, "kind": "raw", "line": line }),
+            for effect in interpreter.feed(&line) {
+                apply_run_effect(
+                    effect,
+                    &req,
+                    &store,
+                    events.as_ref(),
+                    app,
+                    db,
+                    settings,
+                    registry,
+                    &mut outcome,
+                    &mut usage_recorded,
+                    &mut gated_calls,
+                    &mut budget_blocked,
                 );
-                // 非代理路径每约 4KB 增量落一次估算用量，让看门狗与预算看板及时可见。
-                if !use_proxy {
-                    est_bytes += line.len() + 1;
-                    while est_bytes as i64 - est_output_recorded * 4 >= 4096 {
-                        let Ok(conn) = db.open() else { break };
-                        if !est_input_recorded {
-                            let input_tokens =
-                                ((req.prompt.chars().count() as f64) / 4.0).ceil().max(1.0) as i64;
-                            let input = UsageInput {
-                                run_id: Some(req.run_id.clone()),
-                                task_id: Some(req.task_id.clone()),
-                                project_id: Some(req.project_id.clone()),
-                                team_id: Some(req.team_id.clone()),
-                                seat_id: req.seat_id.clone(),
-                                agent_id: Some(req.agent_id.clone()),
-                                provider: crate::usage::provider_for(&req.model),
-                                model: req.model.clone(),
-                                input_tokens,
-                                output_tokens: 0,
-                                cache_read_tokens: 0,
-                                cache_write_tokens: 0,
-                                source: "estimate".into(),
-                                dedupe_key: format!("estimate:{}:input", req.run_id),
-                            };
-                            let _ = store.record_usage_on(&conn, &input);
-                            est_input_recorded = true;
-                        }
-                        let input = UsageInput {
-                            run_id: Some(req.run_id.clone()),
-                            task_id: Some(req.task_id.clone()),
-                            project_id: Some(req.project_id.clone()),
-                            team_id: Some(req.team_id.clone()),
-                            seat_id: req.seat_id.clone(),
-                            agent_id: Some(req.agent_id.clone()),
-                            provider: crate::usage::provider_for(&req.model),
-                            model: req.model.clone(),
-                            input_tokens: 0,
-                            output_tokens: 1024,
-                            cache_read_tokens: 0,
-                            cache_write_tokens: 0,
-                            source: "estimate".into(),
-                            dedupe_key: format!(
-                                "estimate:{}:out:{}",
-                                req.run_id, est_output_recorded
-                            ),
-                        };
-                        let _ = store.record_usage_on(&conn, &input);
-                        est_output_recorded += 1024;
-                        events.emit("usage.updated", json!({ "runId": req.run_id }));
-                    }
-                }
             }
         }
     }
-
+    for effect in interpreter.finish() {
+        apply_run_effect(
+            effect,
+            &req,
+            &store,
+            events.as_ref(),
+            app,
+            db,
+            settings,
+            registry,
+            &mut outcome,
+            &mut usage_recorded,
+            &mut gated_calls,
+            &mut budget_blocked,
+        );
+    }
     let status = child.wait().await;
     let exit_code = status.as_ref().ok().and_then(|s| s.code()).unwrap_or(-1);
 
@@ -1061,102 +963,12 @@ pub async fn execute(
         }
     }
 
-    if !is_claude && !generic_output.trim().is_empty() {
-        if store
-            .insert_message(MessageRecord {
-                task_id: &req.task_id,
-                run_id: &req.run_id,
-                seat_id: req.seat_id.as_deref(),
-                agent_id: &req.agent_id,
-                kind: "chat",
-                role: Some("assistant"),
-                content: generic_output.trim(),
-                meta: json!({ "source": "stdout" }),
-            })
-            .is_ok()
-        {
-            events.emit(
-                "run.delta",
-                json!({
-                    "runId": req.run_id,
-                    "kind": "message",
-                    "message": {
-                        "taskId": req.task_id,
-                        "runId": req.run_id,
-                        "seatId": req.seat_id,
-                        "agentId": req.agent_id,
-                        "kind": "chat",
-                        "role": "assistant",
-                        "content": generic_output.trim(),
-                        "createdAt": now_ms()
-                    }
-                }),
-            );
-        }
-        if outcome.final_text.is_empty() {
-            outcome.final_text = generic_output.trim().to_string();
-        }
-        // 非 Claude 适配器没有结构化 usage，按字符数增量估算并标记来源，避免重复计费。
-        if !use_proxy {
-            if let Ok(conn) = db.open() {
-                let input_tokens =
-                    ((req.prompt.chars().count() as f64) / 4.0).ceil().max(1.0) as i64;
-                if !est_input_recorded {
-                    let input = UsageInput {
-                        run_id: Some(req.run_id.clone()),
-                        task_id: Some(req.task_id.clone()),
-                        project_id: Some(req.project_id.clone()),
-                        team_id: Some(req.team_id.clone()),
-                        seat_id: req.seat_id.clone(),
-                        agent_id: Some(req.agent_id.clone()),
-                        provider: crate::usage::provider_for(&req.model),
-                        model: req.model.clone(),
-                        input_tokens,
-                        output_tokens: 0,
-                        cache_read_tokens: 0,
-                        cache_write_tokens: 0,
-                        source: "estimate".into(),
-                        dedupe_key: format!("estimate:{}:input", req.run_id),
-                    };
-                    let _ = store.record_usage_on(&conn, &input);
-                }
-                let total_output = ((generic_output.chars().count() as f64) / 4.0)
-                    .ceil()
-                    .max(1.0) as i64;
-                let delta = (total_output - est_output_recorded).max(0);
-                if delta > 0 {
-                    let input = UsageInput {
-                        run_id: Some(req.run_id.clone()),
-                        task_id: Some(req.task_id.clone()),
-                        project_id: Some(req.project_id.clone()),
-                        team_id: Some(req.team_id.clone()),
-                        seat_id: req.seat_id.clone(),
-                        agent_id: Some(req.agent_id.clone()),
-                        provider: crate::usage::provider_for(&req.model),
-                        model: req.model.clone(),
-                        input_tokens: 0,
-                        output_tokens: delta,
-                        cache_read_tokens: 0,
-                        cache_write_tokens: 0,
-                        source: "estimate".into(),
-                        dedupe_key: format!("estimate:{}:out:final", req.run_id),
-                    };
-                    if store.record_usage_on(&conn, &input).is_some() {
-                        events.emit("usage.updated", json!({ "runId": req.run_id }));
-                        budget_blocked |=
-                            handle_alerts(app, &conn, &req, registry, settings.notify);
-                    }
-                }
-            }
-        }
-    }
-
     // 代理已开启但没有捕获到任何模型流量（适配器不识别注入变量等）：回退估算，避免完全漏计。
     if use_proxy && !proxy.usage_recorded(&req.run_id) {
-        let text = if generic_output.trim().is_empty() {
+        let text = if interpreter.text_buffer().trim().is_empty() {
             outcome.final_text.clone()
         } else {
-            generic_output.clone()
+            interpreter.text_buffer().to_string()
         };
         if let Ok(conn) = db.open() {
             let input_tokens = ((req.prompt.chars().count() as f64) / 4.0).ceil().max(1.0) as i64;
