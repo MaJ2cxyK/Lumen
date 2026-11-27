@@ -13,10 +13,13 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+mod events;
 mod policy;
+
+use events::{RunEvents, TauriEvents};
 
 #[cfg(windows)]
 use crate::sandbox::session::SandboxSession;
@@ -300,6 +303,7 @@ pub async fn execute(
         agent_id: req.agent_id.clone(),
         finalized: false,
     };
+    let events: Arc<dyn RunEvents> = Arc::new(TauriEvents::new(app.clone()));
     let tpath = transcript_path(base_dir, &req.run_id);
     let run_dir = base_dir.join("sessions").join(&req.run_id);
     std::fs::create_dir_all(&run_dir)?;
@@ -334,7 +338,7 @@ pub async fn execute(
             Some(&req.agent_name),
             json!({ "stage": req.stage_key, "adapter": req.adapter }),
         )?;
-        let _ = app.emit(
+        events.emit(
             "run.status",
             json!({ "runId": req.run_id, "status": "running", "taskId": req.task_id }),
         );
@@ -493,7 +497,7 @@ pub async fn execute(
                     "未找到可用的模型供应商；本次使用进程隔离",
                 )
             };
-            log_sandbox_fallback(app, db, &req, reason, warning);
+            log_sandbox_fallback(events.as_ref(), db, &req, reason, warning);
             isolation_reason = Some(reason.to_string());
         } else {
             match prepare_sandbox(
@@ -515,7 +519,13 @@ pub async fn execute(
                     sandbox = Some(run.session);
                 }
                 Err(fallback) => {
-                    log_sandbox_fallback(app, db, &req, fallback.code, &fallback.message);
+                    log_sandbox_fallback(
+                        events.as_ref(),
+                        db,
+                        &req,
+                        fallback.code,
+                        &fallback.message,
+                    );
                     isolation_reason = Some(fallback.code.to_string());
                 }
             }
@@ -682,7 +692,7 @@ pub async fn execute(
                 rusqlite::params![isolation, req.run_id],
             );
         }
-        let _ = app.emit(
+        events.emit(
             "run.status",
             json!({
                 "runId": req.run_id,
@@ -705,6 +715,7 @@ pub async fn execute(
     }
     let _watchdog = WatchdogGuard(spawn_watchdog(
         app.clone(),
+        events.clone(),
         db.clone(),
         registry.clone(),
         req.clone(),
@@ -804,7 +815,7 @@ pub async fn execute(
                                     Some(&req.agent_name),
                                     json!({ "messageId": msg_id, "chars": text.chars().count() }),
                                 );
-                                let _ = app.emit(
+                                events.emit(
                                     "run.delta",
                                     json!({
                                         "runId": req.run_id,
@@ -851,7 +862,7 @@ pub async fn execute(
                                             rusqlite::params![call_id, req.run_id, tool_name, input.to_string(), now_ms()],
                                         );
                                     }
-                                    let _ = app.emit(
+                                    events.emit(
                                         "run.delta",
                                         json!({
                                             "runId": req.run_id,
@@ -909,7 +920,7 @@ pub async fn execute(
                                     };
                                     if let Ok(Some(cost)) = record(&conn, &input) {
                                         recorded_any = true;
-                                        let _ = app
+                                        events
                                             .emit("usage.updated", json!({ "runId": req.run_id }));
                                         budget_blocked |= handle_alerts(
                                             app,
@@ -918,7 +929,7 @@ pub async fn execute(
                                             registry,
                                             settings.notify,
                                         );
-                                        let _ = app.emit(
+                                        events.emit(
                                             "run.delta",
                                             json!({
                                                 "runId": req.run_id,
@@ -958,7 +969,7 @@ pub async fn execute(
                                                 rusqlite::params![output.to_string(), now_ms(), call_id],
                                             );
                                         }
-                                        let _ = app.emit(
+                                        events.emit(
                                             "run.delta",
                                             json!({ "runId": req.run_id, "kind": "tool_result", "toolCallId": call_id }),
                                         );
@@ -1037,7 +1048,7 @@ pub async fn execute(
             } else {
                 generic_output.push_str(&line);
                 generic_output.push('\n');
-                let _ = app.emit(
+                events.emit(
                     "run.delta",
                     json!({ "runId": req.run_id, "kind": "raw", "line": line }),
                 );
@@ -1089,7 +1100,7 @@ pub async fn execute(
                         };
                         let _ = record(&conn, &input);
                         est_output_recorded += 1024;
-                        let _ = app.emit("usage.updated", json!({ "runId": req.run_id }));
+                        events.emit("usage.updated", json!({ "runId": req.run_id }));
                     }
                 }
             }
@@ -1127,7 +1138,7 @@ pub async fn execute(
                 generic_output.trim(),
                 json!({ "source": "stdout" }),
             );
-            let _ = app.emit(
+            events.emit(
                 "run.delta",
                 json!({
                     "runId": req.run_id,
@@ -1194,7 +1205,7 @@ pub async fn execute(
                         dedupe_key: format!("estimate:{}:out:final", req.run_id),
                     };
                     if crate::usage::record(&conn, &input).ok().flatten().is_some() {
-                        let _ = app.emit("usage.updated", json!({ "runId": req.run_id }));
+                        events.emit("usage.updated", json!({ "runId": req.run_id }));
                         budget_blocked |=
                             handle_alerts(app, &conn, &req, registry, settings.notify);
                     }
@@ -1230,7 +1241,7 @@ pub async fn execute(
                 dedupe_key: format!("estimate:{}:fallback", req.run_id),
             };
             if crate::usage::record(&conn, &input).ok().flatten().is_some() {
-                let _ = app.emit("usage.updated", json!({ "runId": req.run_id }));
+                events.emit("usage.updated", json!({ "runId": req.run_id }));
                 budget_blocked |= handle_alerts(app, &conn, &req, registry, settings.notify);
             }
         }
@@ -1269,7 +1280,7 @@ pub async fn execute(
                 json!({ "calls": calls, "count": unseen.len() }),
             );
         }
-        let _ = app.emit(
+        events.emit(
             "run.delta",
             json!({
                 "runId": req.run_id,
@@ -1342,7 +1353,7 @@ pub async fn execute(
         if let Some(tx) = tx {
             let _ = tx.commit();
         }
-        let _ = app.emit(
+        events.emit(
             "run.status",
             json!({
                 "runId": req.run_id,
@@ -1513,7 +1524,13 @@ fn git_sandbox_fallback(project_path: &Path) -> Option<SandboxFallback> {
 
 /// 记录一次显式回退，避免“设置显示已开启、实际却未隔离”时无迹可查。
 #[cfg(windows)]
-fn log_sandbox_fallback(app: &AppHandle, db: &Db, req: &RunRequest, reason: &str, warning: &str) {
+fn log_sandbox_fallback(
+    events: &dyn RunEvents,
+    db: &Db,
+    req: &RunRequest,
+    reason: &str,
+    warning: &str,
+) {
     tracing::warn!("{warning}");
     if let Ok(conn) = db.open() {
         let _ = conn.execute(
@@ -1530,7 +1547,7 @@ fn log_sandbox_fallback(app: &AppHandle, db: &Db, req: &RunRequest, reason: &str
             json!({ "reason": reason, "message": warning, "isolation": "process" }),
         );
     }
-    let _ = app.emit(
+    events.emit(
         "run.delta",
         json!({
             "runId": req.run_id,
@@ -1649,6 +1666,7 @@ impl Drop for WatchdogGuard {
 
 fn spawn_watchdog(
     app: AppHandle,
+    events: Arc<dyn RunEvents>,
     db: Db,
     registry: Arc<RunRegistry>,
     req: RunRequest,
@@ -1679,7 +1697,7 @@ fn spawn_watchdog(
                     );
                 }
                 registry.cancel(&req.run_id);
-                let _ = app.emit(
+                events.emit(
                     "run.delta",
                     json!({
                         "runId": req.run_id,
