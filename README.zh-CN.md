@@ -93,7 +93,7 @@ Tauri commands（src-tauri/src/commands.rs，约 100 个命令）
         │
         ├── SQLite（db.rs，21 张表，WAL，版本化迁移）
         ├── orchestrator.rs  阶段流水线、门禁、任务状态推进
-        │        └── runtime.rs  子进程启动、流式输出、用量采集
+        │        └── runtime/  运行会话：启动计划、流式输出、用量、事件
         │                ├── approval.rs  工具审批网关与规则
         │                ├── llm_proxy.rs  本地模型代理、请求级预算
         │                └── sandbox/  Job Object / AppContainer
@@ -113,7 +113,7 @@ Tauri commands（src-tauri/src/commands.rs，约 100 个命令）
 | `src/lib/taskLifecycle.ts` | 持久化任务状态、派生看板阶段、注意力规则与共享动作守卫 |
 | `src-tauri/src/commands.rs` | Tauri 命令入口与大部分 SQL 编排 |
 | `src-tauri/src/orchestrator.rs` | 团队席位顺序、阶段门禁、派发与恢复 |
-| `src-tauri/src/runtime.rs` | CLI 子进程、stream-json、用量、取消与超时 |
+| `src-tauri/src/runtime/` | 运行会话：`session.rs`、`launch.rs`、`stream.rs`、`store.rs`、`events.rs`、`policy.rs` |
 | `src-tauri/src/approval.rs` | Hook 审批、审批规则、状态一致性 |
 | `src-tauri/src/review.rs` | Git diff、还原、提交、应用、分支、PR、快照回滚 |
 | `src-tauri/src/db.rs` | schema、迁移、事件序号、消息与清理 |
@@ -241,7 +241,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --all-targets
 ## 接手提示
 
 1. 先跑通“快速开始”和“测试与验收”，再改代码。
-2. 从 `commands.rs` 看命令边界，从 `orchestrator.rs` 看任务状态机，从 `runtime.rs` 看进程生命周期。
+2. 从 `commands.rs` 看命令边界，从 `orchestrator.rs` 看任务状态机，从 `runtime/session.rs` 看进程生命周期。
 3. 涉及审批、预算、进程或数据删除的改动，优先检查事务、终态清理和失败路径。
 4. 修改 UI 后执行 `npm run gate:ui`；修改 Rust 后执行 clippy（带 `-D warnings`）和全量测试。
 
