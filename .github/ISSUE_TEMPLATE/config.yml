@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/MaJ2cxyK/Lumen/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue for security problems.
+  - name: Read the documentation
+    url: https://github.com/MaJ2cxyK/Lumen/blob/main/README.md
+    about: Check the quick start, supported platforms, commands, and known limitations.

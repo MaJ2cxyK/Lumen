@@ -1,0 +1,36 @@
+{
+  "key": "office-ops",
+  "name": "办公协作组",
+  "description": "面向文档、资料与日常办公产出的轻量协作团队",
+  "icon": "🗂️",
+  "roles": [
+    {
+      "roleKey": "intake",
+      "roleName": "需求整理",
+      "responsibility": "澄清目标、受众、交付格式与截止时间",
+      "capability": "office",
+      "gate": false
+    },
+    {
+      "roleKey": "researcher",
+      "roleName": "资料研究员",
+      "responsibility": "收集与核对资料、提炼要点、标注来源",
+      "capability": "research",
+      "gate": false
+    },
+    {
+      "roleKey": "writer",
+      "roleName": "文档工程师",
+      "responsibility": "按目标撰写/整理文档、表格或演示材料",
+      "capability": "office",
+      "gate": false
+    },
+    {
+      "roleKey": "reviewer",
+      "roleName": "审核交付",
+      "responsibility": "检查准确性、完整性与格式，输出交付说明",
+      "capability": "review",
+      "gate": true
+    }
+  ]
+}

@@ -1,0 +1,99 @@
+# Build and release outputs
+node_modules
+dist
+release
+src-tauri/target
+coverage
+.nyc_output
+artifacts
+
+# Local agent, browser and editor state
+.trae
+.browser
+.codex
+.vscode
+.idea
+.fleet
+.history
+
+# Credentials and machine-local configuration
+.certs
+.keys
+.env
+.env.*
+.npmrc
+.yarnrc
+.yarnrc.yml
+.pypirc
+id_rsa*
+id_ed25519*
+secrets.json
+secrets.yaml
+secrets.yml
+credentials.json
+credentials.yaml
+credentials.yml
+*.secret
+*.pfx
+*.p12
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.p8
+*.jks
+*.keystore
+*.snk
+*.kdbx
+*.gpg
+
+# Private release configuration and generated updater metadata
+src-tauri/tauri.publish.conf.json
+latest.json
+
+# Runtime data, logs and local backups
+*.db
+*.sqlite*
+*.log
+*.har
+*.dmp
+*.dump
+*.bak
+*.tmp
+*.temp
+*.orig
+*.rej
+
+# Internal documents and reviews
+*.internal.md
+internal-docs/
+audit-reports/
+Lumen-深度审计报告.md
+
+# Local design references and third-party UI captures
+参考图/
+参考截图/
+参考资料/
+design-refs/
+moodboard/
+
+# Local binaries and archives
+*.exe
+*.msi
+*.msix
+*.appx
+*.dmg
+*.pkg
+*.deb
+*.rpm
+*.AppImage
+*.snap
+*.nsis.zip
+*.7z
+*.rar
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini

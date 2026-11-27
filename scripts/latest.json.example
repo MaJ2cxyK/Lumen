@@ -1,0 +1,11 @@
+{
+  "version": "0.1.1",
+  "notes": "Bug fixes and stability improvements.",
+  "pub_date": "2026-11-23T00:00:00.000Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "把同名 Lumen_0.1.1_x64-setup.exe.sig 文件的完整内容粘贴到这里",
+      "url": "https://github.com/OWNER/REPO/releases/latest/download/Lumen_0.1.1_x64-setup.exe"
+    }
+  }
+}

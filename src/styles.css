@@ -1,0 +1,413 @@
+@import "tailwindcss";
+
+@theme {
+  --color-base: #1a1b18;
+  --color-card: #212320;
+  --color-line: #34362f;
+  --color-primary: #86b79b;
+  --color-success: #6fae86;
+  --color-warn: #d0a15f;
+  --color-danger: #d47a6f;
+  --color-info: #86a9bf;
+  --color-ink: #e8e9e2;
+  --color-muted: #9a9e91;
+  --color-elevated: #252722;
+  --color-modal: #1e201c;
+  --color-hover: rgba(255, 255, 255, 0.055);
+  --color-soft: rgba(255, 255, 255, 0.045);
+  --color-soft2: rgba(255, 255, 255, 0.09);
+  --font-sans: "HarmonyOS Sans SC", "Noto Sans SC", "Inter",
+    "Segoe UI Variable Text", "Segoe UI", "MiSans", "PingFang SC",
+    "Microsoft YaHei UI", "Microsoft YaHei", Helvetica, Arial, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", "Cascadia Code", Consolas,
+    "SFMono-Regular", monospace;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  html {
+    color-scheme: dark;
+    --scrollbar: #3a3d35;
+    --scrollbar-hover: #4a4e44;
+    /* 席位色：仅用于头像与状态圆点，保持低饱和，避免多强调色。 */
+    --seat-1: #4f7a63;
+    --seat-2: #56718a;
+    --seat-3: #9a6b5e;
+    --seat-4: #6f7a45;
+    --seat-5: #7b6484;
+    --seat-6: #a07c33;
+  }
+
+  html[data-theme="light"] {
+    color-scheme: light;
+    --color-base: #f7f7f4;
+    --color-card: #ffffff;
+    --color-line: #e6e5df;
+    --color-primary: #4f7a63;
+    --color-success: #3d7a52;
+    --color-warn: #9a6b24;
+    --color-danger: #b04a3f;
+    --color-info: #4b6f86;
+    --color-ink: #24261f;
+    --color-muted: #73776d;
+    --color-elevated: #fcfcfa;
+    --color-modal: #ffffff;
+    --color-hover: rgba(32, 35, 31, 0.045);
+    --color-soft: rgba(32, 35, 31, 0.05);
+    --color-soft2: rgba(32, 35, 31, 0.08);
+    --scrollbar: rgba(32, 35, 31, 0.2);
+    --scrollbar-hover: rgba(32, 35, 31, 0.32);
+    --seat-1: #3d6650;
+    --seat-2: #44607a;
+    --seat-3: #855545;
+    --seat-4: #5a6735;
+    --seat-5: #6a5474;
+    --seat-6: #7d5f1f;
+  }
+
+  /* 主题色：只替换强调色与轻微底色，保持界面中性。 */
+  html[data-theme="dark"][data-accent="mint"] {
+    --color-primary: #7fc0b8;
+    --color-base: #171c1a;
+    --color-card: #1e2421;
+    --color-elevated: #222925;
+    --color-line: #303833;
+  }
+
+  html[data-theme="light"][data-accent="mint"] {
+    --color-primary: #3f7f79;
+    --color-base: #f5f8f6;
+    --color-line: #e2e8e3;
+  }
+
+  html[data-theme="dark"][data-accent="honey"] {
+    --color-primary: #d9b979;
+    --color-base: #1c1b16;
+    --color-card: #23221c;
+    --color-elevated: #28261f;
+    --color-line: #37342b;
+  }
+
+  html[data-theme="light"][data-accent="honey"] {
+    --color-primary: #8a6a2f;
+    --color-base: #faf7ef;
+    --color-line: #e9e3d5;
+  }
+
+  html[data-theme="dark"][data-accent="parchment"] {
+    --color-primary: #c8ae8c;
+    --color-base: #1d1914;
+    --color-card: #24201a;
+    --color-elevated: #29241d;
+    --color-line: #39332a;
+  }
+
+  html[data-theme="light"][data-accent="parchment"] {
+    --color-primary: #7a6248;
+    --color-base: #f8f4ec;
+    --color-line: #e8e0d2;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--color-base);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    letter-spacing: -0.003em;
+    -webkit-font-smoothing: antialiased;
+    font-synthesis-weight: none;
+    text-rendering: optimizeLegibility;
+    font-variant-numeric: tabular-nums;
+    overflow: hidden;
+  }
+
+  /* 标题换行更均衡，避免末行单词孤悬。 */
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar) transparent;
+  }
+
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background: var(--scrollbar);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background: var(--scrollbar-hover);
+    background-clip: content-box;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  button {
+    cursor: pointer;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--color-primary) 26%, transparent);
+  }
+}
+
+/* 字阶：正文 14px，次级 13.5px，辅助 12.5px，最小不低于 12px。
+   历史遗留的任意像素字号一律收敛到这三档。 */
+.text-xs {
+  font-size: 12.5px;
+}
+
+.text-sm {
+  font-size: 13.5px;
+}
+
+/* markdown in chat */
+.md {
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--color-ink);
+  word-break: break-word;
+}
+
+.md > *:first-child {
+  margin-top: 0;
+}
+
+.md > *:last-child {
+  margin-bottom: 0;
+}
+
+.md h1,
+.md h2,
+.md h3,
+.md h4 {
+  font-weight: 700;
+  color: var(--color-ink);
+  margin: 0.9em 0 0.4em;
+  line-height: 1.35;
+}
+
+.md h1 {
+  font-size: 16px;
+}
+.md h2 {
+  font-size: 15px;
+}
+.md h3 {
+  font-size: 14px;
+}
+.md h4 {
+  font-size: 13.5px;
+}
+
+.md p {
+  margin: 0.45em 0;
+}
+
+.md ul,
+.md ol {
+  margin: 0.45em 0;
+  padding-left: 1.3em;
+}
+
+.md ul {
+  list-style: disc;
+}
+
+.md ol {
+  list-style: decimal;
+}
+
+.md li {
+  margin: 0.18em 0;
+}
+
+.md li::marker {
+  color: var(--color-primary);
+}
+
+.md strong {
+  color: var(--color-ink);
+  font-weight: 600;
+}
+
+.md a {
+  color: var(--color-primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.md code {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  background: color-mix(in srgb, var(--color-primary) 9%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-primary) 16%, transparent);
+  border-radius: 5px;
+  padding: 1px 5px;
+  color: var(--color-primary);
+}
+
+.md pre {
+  margin: 0.6em 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--color-elevated);
+  border: 1px solid var(--color-line);
+  overflow-x: auto;
+}
+
+.md pre code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: var(--color-ink);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.md blockquote {
+  margin: 0.5em 0;
+  border-left: 2px solid var(--color-primary);
+  padding-left: 10px;
+  color: var(--color-muted);
+}
+
+.md table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.5em 0;
+  font-size: 13px;
+}
+
+.md th,
+.md td {
+  border: 1px solid var(--color-line);
+  padding: 4px 8px;
+  text-align: left;
+}
+
+.md th {
+  background: var(--color-elevated);
+  color: var(--color-ink);
+}
+
+.md hr {
+  border: none;
+  border-top: 1px solid var(--color-line);
+  margin: 0.8em 0;
+}
+
+/* recharts */
+.recharts-default-tooltip {
+  border-radius: 8px;
+}
+
+.recharts-cartesian-axis-tick-value {
+  fill: var(--color-muted);
+  font-size: 12px;
+}
+
+.recharts-surface:focus {
+  outline: none;
+}
+
+/* timeline connector */
+.timeline-item:not(:last-child)::before {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 16px;
+  bottom: -10px;
+  width: 1px;
+  background: var(--color-line);
+}
+
+details > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+details > summary::-webkit-details-marker {
+  display: none;
+}
+
+/* 键盘焦点：所有原生可聚焦控件都给出可见外框，不依赖组件逐个声明。 */
+:where(button, select, summary, a[href], [role="button"]):focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-primary) 55%, transparent);
+  outline-offset: 2px;
+}
+
+/* 输入框自适应高度时隐藏滚动条，超出上限仍可滚动。 */
+.composer {
+  scrollbar-width: none;
+}
+
+.composer::-webkit-scrollbar {
+  display: none;
+}
+
+/* 边框统一 0.5px：高分屏下更接近 1 物理像素，避免视觉发粗。
+   放在 layer 之外，确保覆盖 Tailwind utilities。 */
+.border {
+  border-width: 0.5px;
+}
+
+.border-t {
+  border-top-width: 0.5px;
+}
+
+.border-b {
+  border-bottom-width: 0.5px;
+}
+
+.border-l {
+  border-left-width: 0.5px;
+}
+
+.border-r {
+  border-right-width: 0.5px;
+}
+
+.border-x {
+  border-left-width: 0.5px;
+  border-right-width: 0.5px;
+}
+
+.border-y {
+  border-top-width: 0.5px;
+  border-bottom-width: 0.5px;
+}
+
+.divide-y > :not([hidden]) ~ :not([hidden]) {
+  border-top-width: 0.5px;
+}
+
+.divide-x > :not([hidden]) ~ :not([hidden]) {
+  border-left-width: 0.5px;
+}
+
+/* 统一的 select 下拉箭头，避免各页面出现原生控件风格 */
+.select-caret {
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238a8e83' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 12px;
+}

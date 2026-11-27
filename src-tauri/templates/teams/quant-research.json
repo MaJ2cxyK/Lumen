@@ -1,0 +1,43 @@
+{
+  "key": "quant-research",
+  "name": "量化研究组",
+  "description": "围绕研究假设组织数据、验证过程与最终结论的协作团队",
+  "icon": "📈",
+  "roles": [
+    {
+      "roleKey": "scope",
+      "roleName": "投研需求",
+      "responsibility": "明确研究标的、时间窗口、数据来源与输出格式",
+      "capability": "office",
+      "gate": false
+    },
+    {
+      "roleKey": "fundamental",
+      "roleName": "基本面分析师",
+      "responsibility": "财报与行业数据、关键指标与估值假设",
+      "capability": "research",
+      "gate": false
+    },
+    {
+      "roleKey": "technical",
+      "roleName": "量价分析师",
+      "responsibility": "价格、成交量与市场结构，识别趋势和关键区间",
+      "capability": "research",
+      "gate": false
+    },
+    {
+      "roleKey": "risk",
+      "roleName": "风控专员",
+      "responsibility": "敞口测算、情景分析、仓位与止损约束",
+      "capability": "review",
+      "gate": true
+    },
+    {
+      "roleKey": "director",
+      "roleName": "研究主管",
+      "responsibility": "汇总分歧、校验证据、形成研究结论",
+      "capability": "review",
+      "gate": true
+    }
+  ]
+}

@@ -1,0 +1,113 @@
+# Lumen 正式签名 + 自动更新发布工作流
+#
+# 发布前需要在仓库 Settings -> Secrets and variables -> Actions 中配置：
+#
+#   Secrets:
+#     WINDOWS_CERT_PFX_BASE64            代码签名证书 .pfx 内容的 base64（无证书时可不配）
+#     WINDOWS_CERT_PFX_PASSWORD          证书密码（无证书时可不配）
+#     TAURI_SIGNING_PRIVATE_KEY          updater 私钥内容（.key 文件全文）
+#     TAURI_SIGNING_PRIVATE_KEY_PASSWORD updater 私钥密码
+#     TAURI_SIGNING_PUBLIC_KEY           updater 公钥（写入发布配置的 plugins.updater.pubkey）
+#
+#   Variables（可选）:
+#     UPDATE_BASE_URL                    更新包下载前缀，默认 https://github.com/<owner>/<repo>/releases/latest/download
+#     SKIP_CODE_SIGN                     true 时跳过 Authenticode 签名；仍保留 updater 签名与 latest.json
+#
+# 相关生成命令：
+#   # 1) 生成 updater 密钥对（私钥内容放入 TAURI_SIGNING_PRIVATE_KEY，公钥放入 TAURI_SIGNING_PUBLIC_KEY）
+#   npx tauri signer generate -w .keys/lumen-updater.key
+#   Get-Content .keys/lumen-updater.key -Raw      # 私钥
+#   Get-Content .keys/lumen-updater.key.pub -Raw  # 公钥
+#
+#   # 2) 把代码签名证书转成 base64，填入 WINDOWS_CERT_PFX_BASE64
+#   [Convert]::ToBase64String([IO.File]::ReadAllBytes("D:\certs\lumen.pfx"))
+#
+#   # 3) 校验证书 base64 是否可用
+#   [IO.File]::WriteAllBytes("$env:TEMP\check.pfx", [Convert]::FromBase64String($env:B64))
+#
+# 触发方式：推送 v* 标签（会创建 Release），或在 Actions 页面手动运行（只上传 artifacts）。
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: 发布说明（留空则使用默认说明；手动运行不会创建 Release）
+        required: false
+        type: string
+      skip_code_sign:
+        description: 无代码签名证书时跳过 Authenticode 签名；updater 签名仍会生成
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build, sign and package
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PFX_PASSWORD: ${{ secrets.WINDOWS_CERT_PFX_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_SIGNING_PUBLIC_KEY: ${{ secrets.TAURI_SIGNING_PUBLIC_KEY }}
+          UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
+          SKIP_CODE_SIGN: ${{ inputs.skip_code_sign || vars.SKIP_CODE_SIGN }}
+          RELEASE_NOTES: ${{ inputs.notes }}
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-ci.ps1
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-windows-${{ github.ref_name }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.exe.sig
+            src-tauri/target/release/bundle/nsis/*.nsis.zip
+            src-tauri/target/release/bundle/nsis/*.nsis.zip.sig
+            src-tauri/target/release/bundle/nsis/latest.json
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Lumen ${{ github.ref_name }}
+          body: ${{ inputs.notes || 'See the assets below for the Windows installer and the auto-update package.' }}
+          draft: false
+          files: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.exe.sig
+            src-tauri/target/release/bundle/nsis/*.nsis.zip
+            src-tauri/target/release/bundle/nsis/*.nsis.zip.sig
+            src-tauri/target/release/bundle/nsis/latest.json

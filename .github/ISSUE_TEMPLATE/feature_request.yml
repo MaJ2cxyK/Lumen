@@ -1,0 +1,71 @@
+name: Feature request
+description: Propose a focused improvement to Lumen.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing an improvement. Describe the user problem first, then the smallest useful solution.
+
+        Do not include secrets, private keys, internal reports, customer data, or unsanitized logs.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is difficult or unsafe today, and who is affected?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the smallest useful behavior or interface change.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing workarounds, simpler options, or reasons not to change the current behavior.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Task orchestration and stage gates
+        - Agent adapters and providers
+        - Approvals and command safety
+        - Sandbox and process isolation
+        - Git review, worktrees, and snapshots
+        - Budgets and usage
+        - Desktop UI and accessibility
+        - Data, backup, and migration
+        - Release, updater, and signing
+        - Documentation and developer experience
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Expected impact
+      description: Explain the benefit, risk, and whether this is a breaking change.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I may be able to help implement this change.
+          required: false

@@ -1,0 +1,119 @@
+name: Bug report
+description: Report a reproducible problem in Lumen.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Please remove API keys, tokens, private keys, local paths, database content, and personal data before submitting.
+
+        Security vulnerabilities must be reported privately through [SECURITY.md](https://github.com/MaJ2cxyK/Lumen/blob/main/SECURITY.md), not in a public issue.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I searched existing issues and did not find the same problem.
+          required: true
+        - label: I am using the latest published Lumen release or current main branch.
+          required: true
+        - label: I removed secrets and personal data from this report.
+          required: true
+
+  - type: input
+    id: lumen_version
+    attributes:
+      label: Lumen version
+      description: Use the version shown in Settings or the release tag.
+      placeholder: 0.1.1
+    validations:
+      required: true
+
+  - type: input
+    id: windows_version
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2 x64
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: Installation method
+      options:
+        - Release installer
+        - Local build from source
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Agent or provider
+      options:
+        - Claude Code
+        - OpenCode
+        - Other CLI agent
+        - None or not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: sandbox
+    attributes:
+      label: Sandbox mode shown in run history
+      options:
+        - AppContainer
+        - Process isolation
+        - Sandbox disabled
+        - Not applicable or not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: List the smallest sequence that reliably triggers the problem.
+      placeholder: |
+        1. Open ...
+        2. Create a task with ...
+        3. Dispatch and observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Paste only the relevant lines. Remove secrets, tokens, local paths, and personal data.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Project size, Git repository, provider proxy state, recent changes, or anything else that may matter.
+    validations:
+      required: false
