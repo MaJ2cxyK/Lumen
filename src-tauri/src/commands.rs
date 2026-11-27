@@ -400,15 +400,23 @@ pub fn project_update(
     Ok(())
 }
 
+/// Counts tasks that still own a run slot, using the lifecycle vocabulary so
+/// project deletion can never disagree with the transition guards.
+fn project_active_task_count(conn: &Connection, project_id: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM tasks WHERE project_id = ?1 AND status IN ({})",
+            task_lifecycle::ACTIVE_STATUSES_SQL
+        ),
+        params![project_id],
+        |r| r.get(0),
+    )?)
+}
+
 #[tauri::command]
 pub fn project_delete(state: State<'_, AppState>, id: String) -> Result<()> {
     let conn = conn(&state)?;
-    let running: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM tasks WHERE project_id = ?1
-           AND status IN ('running', 'queued', 'waiting_approval')",
-        params![id],
-        |r| r.get(0),
-    )?;
+    let running = project_active_task_count(&conn, &id)?;
     if running > 0 {
         return Err("项目下有任务正在运行，请先停止后再删除项目".into());
     }
@@ -938,6 +946,23 @@ mod tests {
         assert_eq!(attention.status_counts.get("completed"), Some(&1));
         assert_eq!(attention.status_counts.get("running"), None);
         assert_eq!(attention.review_count, 1);
+    }
+
+    #[test]
+    fn project_delete_counts_only_active_tasks() {
+        let conn = seed_tasks();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, description, status, priority, created_at)
+             VALUES ('t6', 'p1', '六', 'f', 'queued', 3, 60),
+                    ('t7', 'p1', '七', 'g', 'running', 3, 50),
+                    ('t8', 'p1', '八', 'h', 'waiting_approval', 3, 40),
+                    ('t9', 'p1', '九', 'i', 'paused', 3, 30)",
+            [],
+        )
+        .unwrap();
+
+        let active = project_active_task_count(&conn, "p1").unwrap();
+        assert_eq!(active, 3);
     }
 }
 

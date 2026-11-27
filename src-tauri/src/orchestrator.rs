@@ -794,7 +794,10 @@ pub async fn run_pipeline(deps: PipelineDeps, task_id: &str, start_stage: i64) -
                         params![task_id],
                         |r| r.get::<_, String>(0),
                     )
-                    .map(|status| status == "paused")
+                    .map(|status| {
+                        crate::task_lifecycle::TaskStatus::parse(&status)
+                            == Some(crate::task_lifecycle::TaskStatus::Paused)
+                    })
                     .unwrap_or(false)
                 };
                 // 用户主动暂停会终止子进程，运行失败属预期行为，不转为阻塞。
