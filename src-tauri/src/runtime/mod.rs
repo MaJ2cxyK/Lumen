@@ -1,33 +1,29 @@
-use crate::approval::{GateRunCtx, GateState};
-use crate::db::{log_event, now_ms, Db};
-use crate::error::{AppError, Result};
-use crate::llm_proxy::{ProxyRun, ProxyState};
+use crate::approval::GateState;
+use crate::db::{log_event, Db};
+use crate::error::Result;
+use crate::llm_proxy::ProxyState;
 use crate::models::AppSettings;
 use crate::sandbox::JobHandle;
-use crate::usage::UsageInput;
-use serde_json::{json, Value};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 mod events;
 mod launch;
 mod policy;
+mod session;
 mod store;
 mod stream;
 
 use events::{RunEvents, TauriEvents};
-use launch::{
-    is_cmd_program, opencode_config, opencode_model, opencode_model_ref, spawn_spec, with_v1,
-};
-use store::{FinishRecord, MessageRecord, RunStore};
-use stream::{MessageOrigin, RunEffect, StreamInterpreter, UsageDelta};
+use launch::is_cmd_program;
+pub use session::{RunDeps, RunSession};
+use store::RunStore;
 
 #[cfg(windows)]
 use crate::sandbox::session::SandboxSession;
@@ -180,284 +176,13 @@ impl RunRegistry {
     }
 }
 
-/// 运行生命周期守卫：任何早退、失败或取消都会归还并发槽、审批上下文、代理上下文与预算预留。
-struct RunGuard {
-    gate: Arc<GateState>,
-    registry: Arc<RunRegistry>,
-    proxy: Arc<ProxyState>,
-    store: RunStore,
-    run_id: String,
-    agent_id: String,
-    finalized: bool,
-}
-
-impl Drop for RunGuard {
-    fn drop(&mut self) {
-        self.gate.unregister(&self.run_id);
-        self.proxy.unregister(&self.run_id);
-        self.registry.finish(&self.run_id);
-        if self.finalized {
-            return;
-        }
-        self.store.mark_interrupted(&self.run_id, &self.agent_id);
-    }
-}
-
-fn transcript_path(base: &Path, run_id: &str) -> PathBuf {
-    base.join("sessions").join(format!("{run_id}.ndjson"))
-}
-
-/// 运行结束（含失败/取消）后自动删除本次运行生成的临时配置。
-struct TempRunDir(PathBuf);
-
-impl Drop for TempRunDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn merge_hooks(base: &mut Value, extra: &Value) {
-    let (Some(base_map), Some(extra_map)) = (base.as_object_mut(), extra.as_object()) else {
-        return;
-    };
-    for (event, entries) in extra_map {
-        let Some(extra_arr) = entries.as_array() else {
-            continue;
-        };
-        let slot = base_map.entry(event.clone()).or_insert_with(|| json!([]));
-        if let Some(arr) = slot.as_array_mut() {
-            arr.extend(extra_arr.iter().cloned());
-        }
-    }
-}
-
-fn append_line(path: &Path, line: &str) {
-    use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{line}");
-    }
-}
-
 fn hash_line(line: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(line.as_bytes());
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
-fn usage_input(req: &RunRequest, delta: &UsageDelta) -> UsageInput {
-    UsageInput {
-        run_id: Some(req.run_id.clone()),
-        task_id: Some(req.task_id.clone()),
-        project_id: Some(req.project_id.clone()),
-        team_id: Some(req.team_id.clone()),
-        seat_id: req.seat_id.clone(),
-        agent_id: Some(req.agent_id.clone()),
-        provider: crate::usage::provider_for(&delta.model),
-        model: delta.model.clone(),
-        input_tokens: delta.input_tokens,
-        output_tokens: delta.output_tokens,
-        cache_read_tokens: delta.cache_read_tokens,
-        cache_write_tokens: delta.cache_write_tokens,
-        source: delta.source.to_string(),
-        dedupe_key: delta.dedupe_key.clone(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn apply_run_effect(
-    effect: RunEffect,
-    req: &RunRequest,
-    store: &RunStore,
-    events: &dyn RunEvents,
-    app: &AppHandle,
-    db: &Db,
-    settings: &AppSettings,
-    registry: &Arc<RunRegistry>,
-    outcome: &mut RunOutcome,
-    usage_recorded: &mut bool,
-    gated_calls: &mut Vec<(String, String)>,
-    budget_blocked: &mut bool,
-) {
-    match effect {
-        RunEffect::SessionObserved { session_id } => {
-            outcome.session_id = Some(session_id.clone());
-            store.set_session(&req.run_id, &session_id);
-        }
-        RunEffect::ChatMessage {
-            model,
-            text,
-            origin,
-        } => {
-            let meta = match origin {
-                MessageOrigin::Claude => json!({
-                    "model": model,
-                    "sessionId": outcome.session_id.as_deref()
-                }),
-                MessageOrigin::Stdout => json!({ "source": "stdout" }),
-            };
-            if let Ok(msg_id) = store.insert_message(MessageRecord {
-                task_id: &req.task_id,
-                run_id: &req.run_id,
-                seat_id: req.seat_id.as_deref(),
-                agent_id: &req.agent_id,
-                kind: "chat",
-                role: Some("assistant"),
-                content: &text,
-                meta,
-            }) {
-                if matches!(origin, MessageOrigin::Claude) {
-                    store.record_event(
-                        req,
-                        "agent.message",
-                        Some(&req.agent_name),
-                        json!({ "messageId": msg_id, "chars": text.chars().count() }),
-                    );
-                }
-                let payload = match origin {
-                    MessageOrigin::Claude => json!({
-                        "runId": req.run_id,
-                        "kind": "message",
-                        "message": {
-                            "id": msg_id,
-                            "taskId": req.task_id,
-                            "runId": req.run_id,
-                            "seatId": req.seat_id,
-                            "agentId": req.agent_id,
-                            "kind": "chat",
-                            "role": "assistant",
-                            "content": text,
-                            "sessionId": outcome.session_id.as_deref(),
-                            "createdAt": now_ms()
-                        }
-                    }),
-                    MessageOrigin::Stdout => json!({
-                        "runId": req.run_id,
-                        "kind": "message",
-                        "message": {
-                            "taskId": req.task_id,
-                            "runId": req.run_id,
-                            "seatId": req.seat_id,
-                            "agentId": req.agent_id,
-                            "kind": "chat",
-                            "role": "assistant",
-                            "content": text,
-                            "createdAt": now_ms()
-                        }
-                    }),
-                };
-                events.emit("run.delta", payload);
-                if matches!(origin, MessageOrigin::Stdout) && outcome.final_text.is_empty() {
-                    outcome.final_text = text.clone();
-                }
-            }
-        }
-        RunEffect::ToolCall {
-            tool_id,
-            tool_name,
-            input,
-            gated,
-        } => {
-            if gated {
-                gated_calls.push((tool_name.clone(), crate::approval::input_hash(&input)));
-            }
-            let call_id = format!("{}:{}", req.run_id, tool_id);
-            store.insert_tool_call(&call_id, &req.run_id, &tool_name, &input);
-            events.emit(
-                "run.delta",
-                json!({
-                    "runId": req.run_id,
-                    "kind": "tool_call",
-                    "toolCall": {
-                        "id": call_id,
-                        "toolName": tool_name,
-                        "input": input,
-                        "status": "running"
-                    }
-                }),
-            );
-        }
-        RunEffect::ToolResult { tool_id, output } => {
-            let call_id = format!("{}:{}", req.run_id, tool_id);
-            store.complete_tool_call(&call_id, &output);
-            events.emit(
-                "run.delta",
-                json!({
-                    "runId": req.run_id,
-                    "kind": "tool_result",
-                    "toolCallId": call_id
-                }),
-            );
-        }
-        RunEffect::Usage(delta) => {
-            let input = usage_input(req, &delta);
-            if let Ok(conn) = db.open() {
-                if let Some(cost) = store.record_usage_on(&conn, &input) {
-                    if delta.report_delta {
-                        *usage_recorded = true;
-                    }
-                    if delta.report_updated {
-                        events.emit("usage.updated", json!({ "runId": req.run_id }));
-                    }
-                    if delta.report_alert {
-                        *budget_blocked |=
-                            handle_alerts(app, &conn, req, registry, settings.notify);
-                    }
-                    if delta.report_delta {
-                        events.emit(
-                            "run.delta",
-                            json!({
-                                "runId": req.run_id,
-                                "kind": "usage",
-                                "usage": {
-                                    "inputTokens": delta.input_tokens,
-                                    "outputTokens": delta.output_tokens,
-                                    "cacheReadTokens": delta.cache_read_tokens,
-                                    "cacheWriteTokens": delta.cache_write_tokens,
-                                    "costMicros": cost
-                                }
-                            }),
-                        );
-                    }
-                }
-            }
-        }
-        RunEffect::RawLine { line } => {
-            events.emit(
-                "run.delta",
-                json!({ "runId": req.run_id, "kind": "raw", "line": line }),
-            );
-        }
-        RunEffect::Result {
-            final_text,
-            session_id,
-            error,
-            fallback_usage,
-        } => {
-            if let Some(text) = final_text {
-                outcome.final_text = text;
-            }
-            if let Some(session_id) = session_id {
-                outcome.session_id = Some(session_id);
-            }
-            if let Some(error) = error {
-                outcome.error = Some(error);
-            }
-            if let Some(delta) = fallback_usage {
-                if !*usage_recorded {
-                    let input = usage_input(req, &delta);
-                    if let Ok(conn) = db.open() {
-                        let _ = store.record_usage_on(&conn, &input);
-                    }
-                }
-            }
-        }
-    }
-}
-
+/// 生产入口：组装依赖后交给 `RunSession`，本身不包含执行逻辑。
 #[allow(clippy::too_many_arguments)]
 pub async fn execute(
     app: &AppHandle,
@@ -469,619 +194,17 @@ pub async fn execute(
     proxy: &Arc<ProxyState>,
     req: RunRequest,
 ) -> Result<RunOutcome> {
-    let Some(cancelled) = registry.register(
-        &req.run_id,
-        &req.task_id,
-        settings.max_concurrent_runs.max(1) as usize,
-    ) else {
-        return Err(AppError::Msg(
-            "并发运行已达上限，请等待当前任务结束或调整设置".into(),
-        ));
-    };
-    let store = RunStore::new(db.clone());
-    // 守卫先于任何可能失败的 IO 建立，保证早退路径也释放槽位与预算。
-    let mut guard = RunGuard {
+    let deps = RunDeps {
+        app: Some(app.clone()),
+        db: db.clone(),
+        base_dir: base_dir.to_path_buf(),
+        settings: settings.clone(),
         gate: gate.clone(),
         registry: registry.clone(),
         proxy: proxy.clone(),
-        store: store.clone(),
-        run_id: req.run_id.clone(),
-        agent_id: req.agent_id.clone(),
-        finalized: false,
+        events: Arc::new(TauriEvents::new(app.clone())),
     };
-    let events: Arc<dyn RunEvents> = Arc::new(TauriEvents::new(app.clone()));
-    let tpath = transcript_path(base_dir, &req.run_id);
-    let run_dir = base_dir.join("sessions").join(&req.run_id);
-    std::fs::create_dir_all(&run_dir)?;
-    let _run_dir_guard = TempRunDir(run_dir.clone());
-
-    store.record_start(&req)?;
-    events.emit(
-        "run.status",
-        json!({ "runId": req.run_id, "status": "running", "taskId": req.task_id }),
-    );
-
-    // 一次性 token 只存在于内存，通过环境变量交给 hook 进程；不落盘、不进命令行。
-    let gate_token = gate.register(GateRunCtx {
-        run_id: req.run_id.clone(),
-        task_id: req.task_id.clone(),
-        project_id: req.project_id.clone(),
-        project_path: req.project_path.to_string_lossy().to_string(),
-        seat_name: req.seat_name.clone(),
-        agent_name: req.agent_name.clone(),
-    });
-
-    let settings_path = run_dir.join("settings.json");
-    let is_claude = req.adapter == "claude-code";
-    let exe = std::env::current_exe().unwrap_or_default();
-    let hook_cmd = format!(
-        "\"{}\" --hook-gate --run-id {}",
-        exe.to_string_lossy(),
-        req.run_id
-    );
-    let mut hooks = json!({
-        "PreToolUse": [{
-            // 覆盖内置写/执行工具与全部 MCP 工具，MCP 调用同样要经过审批网关。
-            "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch|mcp__.*",
-            "hooks": [{ "type": "command", "command": hook_cmd, "timeout": 600 }]
-        }]
-    });
-    if is_claude {
-        let conn = db.open()?;
-        let extra = crate::extensions::extra_hooks(&conn)?;
-        merge_hooks(&mut hooks, &extra);
-    }
-    let settings_json = json!({ "hooks": hooks });
-    std::fs::write(&settings_path, settings_json.to_string())?;
-
-    let provider = {
-        let conn = db.open()?;
-        crate::providers::resolved(&conn, &req.agent_id)?
-    };
-    let use_proxy = settings.proxy_enabled && provider.is_some();
-    // 关闭代理时直接注入供应商环境；真实 Key 因此会进入子进程，不能启用文件级沙箱。
-    let direct_provider_env = if !settings.proxy_enabled && provider.is_some() {
-        let conn = db.open()?;
-        Some(crate::providers::env_for_agent(&conn, &req.agent_id)?)
-    } else {
-        None
-    };
-
-    let mut mcp_config_path: Option<PathBuf> = None;
-    let mut plugin_dirs: Vec<PathBuf> = Vec::new();
-    if is_claude {
-        let conn = db.open()?;
-        mcp_config_path = crate::extensions::mcp_config(&conn, &run_dir)?;
-        plugin_dirs = crate::extensions::plugin_dirs(&conn, base_dir)?;
-    }
-
-    let mut args: Vec<String> = Vec::new();
-    if is_claude {
-        args.extend([
-            "-p".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--include-partial-messages".to_string(),
-            "--verbose".to_string(),
-            "--permission-mode".to_string(),
-            "default".to_string(),
-            "--settings".to_string(),
-            settings_path.to_string_lossy().to_string(),
-        ]);
-        if let Some(path) = &mcp_config_path {
-            args.push("--mcp-config".to_string());
-            args.push(path.to_string_lossy().to_string());
-            args.push("--strict-mcp-config".to_string());
-        }
-        for dir in &plugin_dirs {
-            args.push("--plugin-dir".to_string());
-            args.push(dir.to_string_lossy().to_string());
-        }
-        if let Some(session) = &req.resume_session {
-            args.push("--resume".to_string());
-            args.push(session.clone());
-        } else {
-            args.push("--session-id".to_string());
-            args.push(req.run_id.clone());
-        }
-        if let Some(budget) = req.budget_usd {
-            args.push("--max-budget-usd".to_string());
-            args.push(format!("{:.4}", budget.max(0.01)));
-        }
-    } else {
-        args.extend(req.args.iter().cloned());
-        if req.adapter == "opencode" {
-            if let Some(provider) = provider.as_ref() {
-                if let Some(model) = opencode_model(provider.model.as_deref(), &req.model) {
-                    if let Some(reference) =
-                        opencode_model_ref(use_proxy, &provider.protocol, &model)
-                    {
-                        args.push("-m".into());
-                        args.push(reference);
-                    }
-                }
-            }
-        }
-    }
-
-    tracing::info!(
-        "spawning run {} via {} ({} args)",
-        req.run_id,
-        req.command,
-        args.len()
-    );
-    // 直接 spawn 可执行文件；只有 .cmd/.bat 或用户填写的完整命令行才经过 cmd，
-    // 任务文本（prompt）永远不再拼进命令行，杜绝 shell 注入。
-    let (program, proc_args) = spawn_spec(&req.command, &args);
-    let mut proc_args = proc_args;
-    let mut program_path = PathBuf::from(&program);
-    let mut via_cmd = is_cmd_program(&program);
-
-    let mut proxy_token: Option<String> = None;
-    if use_proxy {
-        let provider = provider.as_ref().expect("provider checked");
-        let token = proxy.register(ProxyRun {
-            run_id: req.run_id.clone(),
-            agent_id: req.agent_id.clone(),
-            project_id: req.project_id.clone(),
-            team_id: req.team_id.clone(),
-            task_id: req.task_id.clone(),
-            seat_id: req.seat_id.clone(),
-            protocol: provider.protocol.clone(),
-            base_url: provider.base_url.clone(),
-            api_key: provider.api_key.clone(),
-            model: provider.model.clone().unwrap_or_else(|| req.model.clone()),
-            notify: settings.notify,
-        });
-        proxy_token = Some(token);
-    }
-
-    // 沙箱准备：仅 Windows + 设置开启 + 代理模式时启用。
-    let mut sandbox: Option<SandboxSession> = None;
-    let mut isolation = "process";
-    let mut isolation_reason: Option<String> = None;
-    #[cfg(windows)]
-    if settings.sandbox_enabled {
-        if !use_proxy {
-            let (reason, warning) = if direct_provider_env.is_some() {
-                (
-                    "proxy_disabled",
-                    "模型代理已关闭，真实 Key 不应进入文件隔离容器；本次使用进程隔离",
-                )
-            } else {
-                (
-                    "provider_unavailable",
-                    "未找到可用的模型供应商；本次使用进程隔离",
-                )
-            };
-            log_sandbox_fallback(events.as_ref(), &store, &req, reason, warning);
-            isolation_reason = Some(reason.to_string());
-        } else {
-            match prepare_sandbox(
-                &req,
-                base_dir,
-                &run_dir,
-                &program,
-                &proc_args,
-                &plugin_dirs,
-                is_claude,
-                gate.port,
-                proxy.port,
-            ) {
-                Ok(run) => {
-                    isolation = "appcontainer";
-                    program_path = run.program;
-                    proc_args = run.args;
-                    via_cmd = run.via_cmd;
-                    sandbox = Some(run.session);
-                }
-                Err(fallback) => {
-                    log_sandbox_fallback(
-                        events.as_ref(),
-                        &store,
-                        &req,
-                        fallback.code,
-                        &fallback.message,
-                    );
-                    isolation_reason = Some(fallback.code.to_string());
-                }
-            }
-        }
-    }
-    if !is_claude && !via_cmd {
-        proc_args.push(req.prompt.clone());
-    }
-
-    let mut env_overrides: HashMap<String, String> = HashMap::new();
-    let mut env_removals: Vec<String> = [
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_MODEL",
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
-        "OPENAI_API_BASE",
-        "OPENAI_MODEL",
-        "OPENCODE_CONFIG_CONTENT",
-        "LUMEN_GATE_URL",
-        "LUMEN_GATE_TOKEN",
-        "LUMEN_RUN_ID",
-    ]
-    .iter()
-    .map(|name| name.to_string())
-    .collect();
-    let mut proxy_base: Option<String> = None;
-    if use_proxy {
-        let token = proxy_token.clone().unwrap_or_default();
-        // 沙箱内必须连接容器 relay 的端口，宿主再桥接到真实代理端口。
-        #[cfg(windows)]
-        let port = sandbox
-            .as_ref()
-            .and_then(|s| s.container_port("proxy"))
-            .unwrap_or(proxy.port);
-        #[cfg(not(windows))]
-        let port = proxy.port;
-        let base = format!("http://127.0.0.1:{port}/proxy/{token}");
-        proxy_base = Some(base.clone());
-        let provider = provider.as_ref().expect("provider checked");
-        match provider.protocol.as_str() {
-            "anthropic" => {
-                env_overrides.insert("ANTHROPIC_BASE_URL".into(), base);
-                env_overrides.insert("ANTHROPIC_AUTH_TOKEN".into(), token);
-                if let Some(model) = &provider.model {
-                    env_overrides.insert("ANTHROPIC_MODEL".into(), model.clone());
-                }
-            }
-            "openai" => {
-                env_overrides.insert("OPENAI_BASE_URL".into(), base);
-                env_overrides.insert("OPENAI_API_KEY".into(), token);
-                if let Some(model) = &provider.model {
-                    env_overrides.insert("OPENAI_MODEL".into(), model.clone());
-                }
-            }
-            _ => {}
-        }
-    } else if let Some((provider_env, provider_removals)) = direct_provider_env {
-        env_removals.extend(provider_removals);
-        env_overrides.extend(provider_env);
-    }
-    if is_claude {
-        // 审批网关上下文只交给 Claude Code：hook 由它的 settings.json 触发。
-        #[cfg(windows)]
-        let gate_port = sandbox
-            .as_ref()
-            .and_then(|s| s.container_port("gate"))
-            .unwrap_or(gate.port);
-        #[cfg(not(windows))]
-        let gate_port = gate.port;
-        env_overrides.insert(
-            "LUMEN_GATE_URL".into(),
-            format!("http://127.0.0.1:{gate_port}"),
-        );
-        env_overrides.insert("LUMEN_GATE_TOKEN".into(), gate_token.clone());
-        env_overrides.insert("LUMEN_RUN_ID".into(), req.run_id.clone());
-    }
-    // OpenCode 1.x 不读取 OPENAI_MODEL；模型必须在 argv 中显式指定，并在
-    // 临时配置里登记，否则会回退到它自带目录中的默认模型。
-    if req.adapter == "opencode" {
-        if let Some(provider) = provider.as_ref() {
-            if let Some(model) = opencode_model(provider.model.as_deref(), &req.model) {
-                if provider.protocol == "anthropic" && use_proxy {
-                    if let Some(token) = proxy_token.as_ref() {
-                        env_overrides.insert("ANTHROPIC_API_KEY".into(), token.clone());
-                    }
-                }
-                let base = if let Some(base) = proxy_base.as_deref() {
-                    format!("{}/v1", base.trim_end_matches('/'))
-                } else {
-                    with_v1(&provider.base_url)
-                };
-                let config = opencode_config(use_proxy, &provider.protocol, &base, &model);
-                env_overrides.insert("OPENCODE_CONFIG_CONTENT".into(), config.to_string());
-            }
-        }
-    }
-    if sandbox.is_some() {
-        let home = base_dir.join("sandbox-home");
-        let home_text = home.to_string_lossy().to_string();
-        let tmp = home.join("tmp");
-        std::fs::create_dir_all(&tmp)
-            .map_err(|e| AppError::Msg(format!("创建沙箱 TEMP {} 失败：{e}", tmp.display())))?;
-        env_overrides.insert("USERPROFILE".into(), home_text.clone());
-        env_overrides.insert("HOME".into(), home_text);
-        env_overrides.insert("TEMP".into(), tmp.to_string_lossy().to_string());
-        env_overrides.insert("TMP".into(), tmp.to_string_lossy().to_string());
-    }
-
-    // 沙箱模式下启动宿主进程，由它把容器 CLI 的标准输入输出转发回来。
-    #[cfg(windows)]
-    let sandbox_spec_path = sandbox.as_ref().map(|session| {
-        let spec_path = run_dir.join("host.json");
-        let spec = session.host_spec(
-            &program_path,
-            &proc_args,
-            &req.project_path,
-            env_overrides.clone(),
-            &run_dir.join("relay-ready.json"),
-            &run_dir.join("host-status.json"),
-        );
-        if let Err(err) = std::fs::write(&spec_path, serde_json::to_vec(&spec).unwrap_or_default())
-        {
-            tracing::warn!("写入沙箱宿主配置失败：{err}");
-        }
-        spec_path
-    });
-    #[cfg(not(windows))]
-    let sandbox_spec_path: Option<PathBuf> = None;
-
-    let mut command = if let Some(spec_path) = &sandbox_spec_path {
-        let mut cmd = tokio::process::Command::new(&exe);
-        cmd.arg("--sandbox-host").arg(spec_path);
-        cmd
-    } else {
-        let mut cmd = tokio::process::Command::new(&program_path);
-        for arg in &proc_args {
-            cmd.arg(arg);
-        }
-        cmd
-    };
-    // P0-1：先清掉继承环境里的真实密钥，任何适配器都不能再直接拿到 Key。
-    for name in &env_removals {
-        command.env_remove(name);
-    }
-    for (name, value) in &env_overrides {
-        command.env(name, value);
-    }
-    command
-        .current_dir(&req.project_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .creation_flags(0x08000000);
-    let mut child = command
-        .spawn()
-        .map_err(|e| AppError::Msg(format!("启动 Agent 失败：{e}")))?;
-    if isolation != "process" {
-        store.set_isolation(&req.run_id, isolation);
-        events.emit(
-            "run.status",
-            json!({
-                "runId": req.run_id,
-                "status": "running",
-                "taskId": req.task_id,
-                "isolation": isolation,
-                "isolationReason": isolation_reason
-            }),
-        );
-    }
-    if let Some(pid) = child.id() {
-        registry.set_pid(&req.run_id, pid);
-        // P0-3：加入 Job Object，退出/取消时由内核终止整棵进程树。
-        if let Some(job) = crate::sandbox::create_job() {
-            if !job.assign(pid) {
-                tracing::warn!("assign process {pid} to job object failed");
-            }
-            registry.set_job(&req.run_id, Arc::new(job));
-        }
-    }
-    let _watchdog = WatchdogGuard(spawn_watchdog(
-        app.clone(),
-        events.clone(),
-        db.clone(),
-        registry.clone(),
-        req.clone(),
-        settings.clone(),
-    ));
-    if is_claude || via_cmd {
-        if let Some(mut stdin) = child.stdin.take() {
-            let prompt = req.prompt.clone();
-            tokio::spawn(async move {
-                let _ = stdin.write_all(prompt.as_bytes()).await;
-                let _ = stdin.shutdown().await;
-            });
-        }
-    } else if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.shutdown().await;
-    }
-
-    if let Some(stderr) = child.stderr.take() {
-        let tpath2 = tpath.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                append_line(&tpath2, &line);
-            }
-        });
-    }
-
-    let mut outcome = RunOutcome::default();
-    let mut usage_recorded = false;
-    let mut budget_blocked = false;
-    // 记录流里出现过的受管工具调用，运行结束时与网关日志比对，识别 hook 绕过。
-    let mut gated_calls: Vec<(String, String)> = Vec::new();
-    let mut interpreter = StreamInterpreter::new(
-        &req.adapter,
-        &req.run_id,
-        &req.model,
-        &req.prompt,
-        use_proxy,
-    );
-
-    if let Some(stdout) = child.stdout.take() {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            append_line(&tpath, &line);
-            if line.trim().is_empty() {
-                continue;
-            }
-            for effect in interpreter.feed(&line) {
-                apply_run_effect(
-                    effect,
-                    &req,
-                    &store,
-                    events.as_ref(),
-                    app,
-                    db,
-                    settings,
-                    registry,
-                    &mut outcome,
-                    &mut usage_recorded,
-                    &mut gated_calls,
-                    &mut budget_blocked,
-                );
-            }
-        }
-    }
-    for effect in interpreter.finish() {
-        apply_run_effect(
-            effect,
-            &req,
-            &store,
-            events.as_ref(),
-            app,
-            db,
-            settings,
-            registry,
-            &mut outcome,
-            &mut usage_recorded,
-            &mut gated_calls,
-            &mut budget_blocked,
-        );
-    }
-    let status = child.wait().await;
-    let exit_code = status.as_ref().ok().and_then(|s| s.code()).unwrap_or(-1);
-
-    // 宿主在 relay 启动失败等场景会写状态文件，优先展示更具体的原因。
-    #[cfg(windows)]
-    if let Some(spec_path) = &sandbox_spec_path {
-        let status_path = spec_path.with_file_name("host-status.json");
-        if let Ok(text) = std::fs::read_to_string(&status_path) {
-            if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                if let Some(err) = value.get("error").and_then(|v| v.as_str()) {
-                    if outcome.error.is_none() {
-                        outcome.error = Some(format!("沙箱宿主错误：{err}"));
-                    }
-                }
-            }
-        }
-    }
-
-    // 代理已开启但没有捕获到任何模型流量（适配器不识别注入变量等）：回退估算，避免完全漏计。
-    if use_proxy && !proxy.usage_recorded(&req.run_id) {
-        let text = if interpreter.text_buffer().trim().is_empty() {
-            outcome.final_text.clone()
-        } else {
-            interpreter.text_buffer().to_string()
-        };
-        if let Ok(conn) = db.open() {
-            let input_tokens = ((req.prompt.chars().count() as f64) / 4.0).ceil().max(1.0) as i64;
-            let output_tokens = ((text.chars().count() as f64) / 4.0).ceil() as i64;
-            let input = UsageInput {
-                run_id: Some(req.run_id.clone()),
-                task_id: Some(req.task_id.clone()),
-                project_id: Some(req.project_id.clone()),
-                team_id: Some(req.team_id.clone()),
-                seat_id: req.seat_id.clone(),
-                agent_id: Some(req.agent_id.clone()),
-                provider: crate::usage::provider_for(&req.model),
-                model: req.model.clone(),
-                input_tokens,
-                output_tokens,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                source: "estimate".into(),
-                dedupe_key: format!("estimate:{}:fallback", req.run_id),
-            };
-            if store.record_usage_on(&conn, &input).is_some() {
-                events.emit("usage.updated", json!({ "runId": req.run_id }));
-                budget_blocked |= handle_alerts(app, &conn, &req, registry, settings.notify);
-            }
-        }
-    }
-
-    // 预算终检：代理侧可能在本次运行中已触发 402 硬停，即便进程正常退出也要暂停。
-    if let Ok(conn) = db.open() {
-        let scope = crate::budget::BudgetScope {
-            project_id: &req.project_id,
-            team_id: &req.team_id,
-            agent_id: &req.agent_id,
-            task_id: &req.task_id,
-            run_id: &req.run_id,
-        };
-        budget_blocked |=
-            proxy.was_blocked(&req.run_id) || crate::budget::spent_exhausted(&conn, &scope);
-    }
-
-    // P1：hook 绕过检测——流里出现过的受管工具，必须都能在网关侧找到同输入记录。
-    let unseen = gate.unseen_tools(&req.run_id, &gated_calls);
-    let hook_bypass = !unseen.is_empty();
-    if hook_bypass {
-        let calls: Vec<Value> = unseen
-            .iter()
-            .take(20)
-            .map(|(tool, hash)| json!({ "tool": tool, "inputHash": hash }))
-            .collect();
-        store.record_event(
-            &req,
-            "hook.bypass",
-            Some("gate"),
-            json!({ "calls": calls, "count": unseen.len() }),
-        );
-        events.emit(
-            "run.delta",
-            json!({
-                "runId": req.run_id,
-                "kind": "warning",
-                "warning": format!("检测到 {} 次未经审批网关的工具调用", unseen.len())
-            }),
-        );
-    }
-
-    let cancelled_now = cancelled.load(Ordering::SeqCst);
-    let (run_status, error) = policy::evaluate(policy::OutcomeInputs {
-        budget_blocked,
-        hook_bypass,
-        hook_strict: settings.hook_strict,
-        cancelled: cancelled_now,
-        exit_code,
-        reported_error: outcome.error.as_deref(),
-    });
-    let run_status = run_status.as_db_str();
-    outcome.success = run_status == "completed";
-    if outcome.error.is_none() {
-        outcome.error = error.clone();
-    }
-
-    if store.finish(FinishRecord {
-        project_id: &req.project_id,
-        task_id: &req.task_id,
-        run_id: &req.run_id,
-        agent_id: &req.agent_id,
-        agent_name: &req.agent_name,
-        status: run_status,
-        exit_code,
-        error: error.as_deref(),
-        session_id: outcome.session_id.as_deref(),
-        isolation,
-        isolation_reason: isolation_reason.as_deref(),
-    }) {
-        events.emit(
-            "run.status",
-            json!({
-                "runId": req.run_id,
-                "status": run_status,
-                "taskId": req.task_id,
-                "error": error,
-                "isolation": isolation,
-                "isolationReason": isolation_reason
-            }),
-        );
-    }
-    // 正常结束：标记守卫已完成，避免 Drop 再写一次 failed。
-    guard.finalized = true;
-
-    Ok(outcome)
+    RunSession::run(&deps, req).await
 }
 
 /// 判断程序名是否为 cmd（含 cmd.exe）。
@@ -1218,12 +341,15 @@ fn prepare_sandbox(
 /// 解析启动方式：真实存在的可执行文件直接 spawn；.cmd/.bat/.ps1 通过 cmd /C；
 /// 用户在配置里填写的完整命令行也交给 cmd（该字符串来自用户配置，不含任务文本）。
 fn handle_alerts(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     conn: &rusqlite::Connection,
     req: &RunRequest,
     registry: &Arc<RunRegistry>,
     notify: bool,
 ) -> bool {
+    let Some(app) = app else {
+        return false;
+    };
     let scope = crate::budget::BudgetScope {
         project_id: &req.project_id,
         team_id: &req.team_id,
@@ -1252,7 +378,7 @@ impl Drop for WatchdogGuard {
 }
 
 fn spawn_watchdog(
-    app: AppHandle,
+    app: Option<AppHandle>,
     events: Arc<dyn RunEvents>,
     db: Db,
     registry: Arc<RunRegistry>,
@@ -1260,6 +386,9 @@ fn spawn_watchdog(
     settings: AppSettings,
 ) -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
+    let Some(app) = app else {
+        return stop;
+    };
     let flag = stop.clone();
     tauri::async_runtime::spawn(async move {
         let started = Instant::now();
@@ -1317,7 +446,7 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(test)]
 mod sandbox_home_tests {
-    use super::*;
+    use serde_json::Value;
 
     #[cfg(windows)]
     #[test]
@@ -1392,5 +521,52 @@ mod opencode_tests {
         assert!(git_needs_process_isolation(&root.join("sub")));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod app_optional_tests {
+    use super::*;
+
+    fn request() -> RunRequest {
+        RunRequest {
+            run_id: "r1".into(),
+            task_id: "task1".into(),
+            project_id: "p1".into(),
+            team_id: "t1".into(),
+            seat_id: None,
+            seat_name: "Seat".into(),
+            agent_id: "a1".into(),
+            agent_name: "Agent".into(),
+            adapter: "generic".into(),
+            command: "cmd".into(),
+            args: vec![],
+            model: "claude".into(),
+            project_path: PathBuf::from("C:/tmp"),
+            stage_key: None,
+            prompt: "hello".into(),
+            resume_session: None,
+            budget_usd: None,
+        }
+    }
+
+    #[test]
+    fn alerts_are_skipped_without_app_handle() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let registry = Arc::new(RunRegistry::default());
+        assert!(!handle_alerts(None, &conn, &request(), &registry, true));
+    }
+
+    #[test]
+    fn watchdog_without_app_handle_does_not_start() {
+        let stop = spawn_watchdog(
+            None,
+            Arc::new(events::RecordingEvents::new()),
+            Db::new(std::env::temp_dir().join("lumen-watchdog-test.db")),
+            Arc::new(RunRegistry::default()),
+            request(),
+            AppSettings::default(),
+        );
+        assert!(!stop.load(Ordering::SeqCst));
     }
 }
