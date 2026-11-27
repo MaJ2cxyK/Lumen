@@ -751,18 +751,16 @@ pub async fn run_pipeline(deps: PipelineDeps, task_id: &str, start_stage: i64) -
                 resume_session,
                 budget_usd,
             };
-            let outcome = match runtime::execute(
-                &deps.app,
-                &deps.db,
-                &deps.base_dir,
-                &deps.settings,
-                &deps.gate,
-                &deps.registry,
-                &deps.proxy,
-                req,
-            )
-            .await
-            {
+            let run_deps = runtime::RunDeps::for_app(
+                deps.app.clone(),
+                deps.db.clone(),
+                deps.base_dir.clone(),
+                deps.settings.clone(),
+                deps.gate.clone(),
+                deps.registry.clone(),
+                deps.proxy.clone(),
+            );
+            let outcome = match runtime::RunSession::run(&run_deps, req).await {
                 Ok(outcome) => outcome,
                 Err(err) => {
                     // runtime 在占用并发槽之前失败时没有守卫，需要在这里归还请求级预留。

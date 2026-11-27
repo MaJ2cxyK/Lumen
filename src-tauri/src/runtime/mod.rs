@@ -1,7 +1,4 @@
-use crate::approval::GateState;
 use crate::db::{log_event, Db};
-use crate::error::Result;
-use crate::llm_proxy::ProxyState;
 use crate::models::AppSettings;
 use crate::sandbox::JobHandle;
 use serde_json::json;
@@ -20,7 +17,7 @@ mod session;
 mod store;
 mod stream;
 
-use events::{RunEvents, TauriEvents};
+use events::RunEvents;
 use launch::is_cmd_program;
 pub use session::{RunDeps, RunSession};
 use store::RunStore;
@@ -184,29 +181,6 @@ fn hash_line(line: &str) -> String {
 
 /// 生产入口：组装依赖后交给 `RunSession`，本身不包含执行逻辑。
 #[allow(clippy::too_many_arguments)]
-pub async fn execute(
-    app: &AppHandle,
-    db: &Db,
-    base_dir: &Path,
-    settings: &AppSettings,
-    gate: &Arc<GateState>,
-    registry: &Arc<RunRegistry>,
-    proxy: &Arc<ProxyState>,
-    req: RunRequest,
-) -> Result<RunOutcome> {
-    let deps = RunDeps {
-        app: Some(app.clone()),
-        db: db.clone(),
-        base_dir: base_dir.to_path_buf(),
-        settings: settings.clone(),
-        gate: gate.clone(),
-        registry: registry.clone(),
-        proxy: proxy.clone(),
-        events: Arc::new(TauriEvents::new(app.clone())),
-    };
-    RunSession::run(&deps, req).await
-}
-
 /// 判断程序名是否为 cmd（含 cmd.exe）。
 /// 沙箱启动所需的解析结果。
 #[cfg(windows)]

@@ -4,7 +4,7 @@
 //! 事件顺序也固定：`run.status(running)` → `run.delta` / `usage.updated` → 恰好一次
 //! 终态 `run.status`。阶段循环、阶段门禁与任务状态流转仍由 orchestrator 负责。
 
-use super::events::RunEvents;
+use super::events::{RunEvents, TauriEvents};
 use super::launch::{
     is_cmd_program, opencode_config, opencode_model, opencode_model_ref, spawn_spec, with_v1,
 };
@@ -34,7 +34,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// 一次运行所需的依赖。
 ///
-/// 生产环境由 `execute` 传入 `Some(app)`；测试可传 `None`，此时跳过界面告警、
+/// 桌面端通过 `for_app` 传入 `Some(app)`；测试可传 `None`，此时跳过界面告警、
 /// 系统通知与看门狗，但用量记账和预算终检仍然执行。
 pub struct RunDeps {
     pub(crate) app: Option<AppHandle>,
@@ -45,6 +45,31 @@ pub struct RunDeps {
     pub(crate) registry: Arc<RunRegistry>,
     pub(crate) proxy: Arc<ProxyState>,
     pub(crate) events: Arc<dyn RunEvents>,
+}
+
+impl RunDeps {
+    /// 桌面端运行所需的依赖；事件直接发送到 Tauri 前端。
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_app(
+        app: AppHandle,
+        db: Db,
+        base_dir: PathBuf,
+        settings: AppSettings,
+        gate: Arc<GateState>,
+        registry: Arc<RunRegistry>,
+        proxy: Arc<ProxyState>,
+    ) -> Self {
+        Self {
+            app: Some(app.clone()),
+            db,
+            base_dir,
+            settings,
+            gate,
+            registry,
+            proxy,
+            events: Arc::new(TauriEvents::new(app)),
+        }
+    }
 }
 
 /// 只负责一次执行尝试；不推进阶段，也不修改任务状态。
