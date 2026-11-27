@@ -1,10 +1,10 @@
 use crate::approval::{GateRunCtx, GateState};
-use crate::db::{insert_message, log_event, now_ms, Db};
+use crate::db::{log_event, now_ms, Db};
 use crate::error::{AppError, Result};
 use crate::llm_proxy::{ProxyRun, ProxyState};
 use crate::models::AppSettings;
 use crate::sandbox::JobHandle;
-use crate::usage::{record, UsageInput};
+use crate::usage::UsageInput;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -18,8 +18,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 mod events;
 mod policy;
+mod store;
 
 use events::{RunEvents, TauriEvents};
+use store::{FinishRecord, MessageRecord, RunStore};
 
 #[cfg(windows)]
 use crate::sandbox::session::SandboxSession;
@@ -177,7 +179,7 @@ struct RunGuard {
     gate: Arc<GateState>,
     registry: Arc<RunRegistry>,
     proxy: Arc<ProxyState>,
-    db: Db,
+    store: RunStore,
     run_id: String,
     agent_id: String,
     finalized: bool,
@@ -191,23 +193,7 @@ impl Drop for RunGuard {
         if self.finalized {
             return;
         }
-        if let Ok(conn) = self.db.open() {
-            let _ = conn.execute(
-                "UPDATE runs SET status = 'failed', error = COALESCE(error, '运行异常中断'), ended_at = ?1
-                 WHERE id = ?2 AND status IN ('starting', 'running')",
-                rusqlite::params![now_ms(), self.run_id],
-            );
-            let _ = conn.execute(
-                "UPDATE agents SET status = 'idle', last_seen_at = ?1 WHERE id = ?2",
-                rusqlite::params![now_ms(), self.agent_id],
-            );
-            let _ = conn.execute(
-                "UPDATE approvals SET status = 'expired', decided_at = ?1, decision_note = '运行异常中断，工具授权已失效'
-                 WHERE run_id = ?2 AND type = 'tool_permission' AND status = 'pending'",
-                rusqlite::params![now_ms(), self.run_id],
-            );
-            let _ = crate::budget::release(&conn, &self.run_id);
-        }
+        self.store.mark_interrupted(&self.run_id, &self.agent_id);
     }
 }
 
@@ -293,12 +279,13 @@ pub async fn execute(
             "并发运行已达上限，请等待当前任务结束或调整设置".into(),
         ));
     };
+    let store = RunStore::new(db.clone());
     // 守卫先于任何可能失败的 IO 建立，保证早退路径也释放槽位与预算。
     let mut guard = RunGuard {
         gate: gate.clone(),
         registry: registry.clone(),
         proxy: proxy.clone(),
-        db: db.clone(),
+        store: store.clone(),
         run_id: req.run_id.clone(),
         agent_id: req.agent_id.clone(),
         finalized: false,
@@ -309,40 +296,11 @@ pub async fn execute(
     std::fs::create_dir_all(&run_dir)?;
     let _run_dir_guard = TempRunDir(run_dir.clone());
 
-    {
-        let conn = db.open()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO runs (id, task_id, seat_id, agent_id, external_session_id, stage_key, status, prompt_text, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'starting', ?7, ?8)",
-            rusqlite::params![
-                req.run_id,
-                req.task_id,
-                req.seat_id,
-                req.agent_id,
-                req.resume_session,
-                req.stage_key,
-                req.prompt,
-                now_ms()
-            ],
-        )?;
-        conn.execute(
-            "UPDATE agents SET status = 'running', last_seen_at = ?1 WHERE id = ?2",
-            rusqlite::params![now_ms(), req.agent_id],
-        )?;
-        log_event(
-            &conn,
-            Some(&req.project_id),
-            Some(&req.task_id),
-            Some(&req.run_id),
-            "run.started",
-            Some(&req.agent_name),
-            json!({ "stage": req.stage_key, "adapter": req.adapter }),
-        )?;
-        events.emit(
-            "run.status",
-            json!({ "runId": req.run_id, "status": "running", "taskId": req.task_id }),
-        );
-    }
+    store.record_start(&req)?;
+    events.emit(
+        "run.status",
+        json!({ "runId": req.run_id, "status": "running", "taskId": req.task_id }),
+    );
 
     // 一次性 token 只存在于内存，通过环境变量交给 hook 进程；不落盘、不进命令行。
     let gate_token = gate.register(GateRunCtx {
@@ -497,7 +455,7 @@ pub async fn execute(
                     "未找到可用的模型供应商；本次使用进程隔离",
                 )
             };
-            log_sandbox_fallback(events.as_ref(), db, &req, reason, warning);
+            log_sandbox_fallback(events.as_ref(), &store, &req, reason, warning);
             isolation_reason = Some(reason.to_string());
         } else {
             match prepare_sandbox(
@@ -521,7 +479,7 @@ pub async fn execute(
                 Err(fallback) => {
                     log_sandbox_fallback(
                         events.as_ref(),
-                        db,
+                        &store,
                         &req,
                         fallback.code,
                         &fallback.message,
@@ -686,12 +644,7 @@ pub async fn execute(
         .spawn()
         .map_err(|e| AppError::Msg(format!("启动 Agent 失败：{e}")))?;
     if isolation != "process" {
-        if let Ok(conn) = db.open() {
-            let _ = conn.execute(
-                "UPDATE runs SET isolation = ?1 WHERE id = ?2",
-                rusqlite::params![isolation, req.run_id],
-            );
-        }
+        store.set_isolation(&req.run_id, isolation);
         events.emit(
             "run.status",
             json!({
@@ -773,12 +726,7 @@ pub async fn execute(
                     "system" => {
                         if let Some(sid) = parsed.get("session_id").and_then(|v| v.as_str()) {
                             outcome.session_id = Some(sid.to_string());
-                            if let Ok(conn) = db.open() {
-                                let _ = conn.execute(
-                                    "UPDATE runs SET external_session_id = ?1 WHERE id = ?2",
-                                    rusqlite::params![sid, req.run_id],
-                                );
-                            }
+                            store.set_session(&req.run_id, sid);
                         }
                     }
                     "assistant" => {
@@ -793,24 +741,18 @@ pub async fn execute(
                         let content = message.get("content").cloned().unwrap_or(Value::Null);
                         let text = text_of_content(&content);
                         if !text.trim().is_empty() {
-                            if let Ok(conn) = db.open() {
-                                let msg_id = insert_message(
-                                    &conn,
-                                    Some(&req.task_id),
-                                    Some(&req.run_id),
-                                    req.seat_id.as_deref(),
-                                    Some(&req.agent_id),
-                                    "chat",
-                                    Some("assistant"),
-                                    &text,
-                                    json!({ "model": model, "sessionId": outcome.session_id }),
-                                )
-                                .ok();
-                                let _ = log_event(
-                                    &conn,
-                                    Some(&req.project_id),
-                                    Some(&req.task_id),
-                                    Some(&req.run_id),
+                            if let Ok(msg_id) = store.insert_message(MessageRecord {
+                                task_id: &req.task_id,
+                                run_id: &req.run_id,
+                                seat_id: req.seat_id.as_deref(),
+                                agent_id: &req.agent_id,
+                                kind: "chat",
+                                role: Some("assistant"),
+                                content: &text,
+                                meta: json!({ "model": model, "sessionId": outcome.session_id }),
+                            }) {
+                                store.record_event(
+                                    &req,
                                     "agent.message",
                                     Some(&req.agent_name),
                                     json!({ "messageId": msg_id, "chars": text.chars().count() }),
@@ -855,13 +797,12 @@ pub async fn execute(
                                         ));
                                     }
                                     let call_id = format!("{}:{}", req.run_id, tool_id);
-                                    if let Ok(conn) = db.open() {
-                                        let _ = conn.execute(
-                                            "INSERT OR IGNORE INTO tool_calls (id, run_id, tool_name, input_json, status, created_at)
-                                             VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
-                                            rusqlite::params![call_id, req.run_id, tool_name, input.to_string(), now_ms()],
-                                        );
-                                    }
+                                    store.insert_tool_call(
+                                        &call_id,
+                                        &req.run_id,
+                                        tool_name,
+                                        &input,
+                                    );
                                     events.emit(
                                         "run.delta",
                                         json!({
@@ -918,7 +859,7 @@ pub async fn execute(
                                         source: "stream".into(),
                                         dedupe_key: format!("claude:{}:{}", req.run_id, message_id),
                                     };
-                                    if let Ok(Some(cost)) = record(&conn, &input) {
+                                    if let Some(cost) = store.record_usage_on(&conn, &input) {
                                         recorded_any = true;
                                         events
                                             .emit("usage.updated", json!({ "runId": req.run_id }));
@@ -963,12 +904,7 @@ pub async fn execute(
                                         let call_id = format!("{}:{}", req.run_id, tool_id);
                                         let output =
                                             block.get("content").cloned().unwrap_or(Value::Null);
-                                        if let Ok(conn) = db.open() {
-                                            let _ = conn.execute(
-                                                "UPDATE tool_calls SET status = 'completed', output_json = ?1, finished_at = ?2 WHERE id = ?3",
-                                                rusqlite::params![output.to_string(), now_ms(), call_id],
-                                            );
-                                        }
+                                        store.complete_tool_call(&call_id, &output);
                                         events.emit(
                                             "run.delta",
                                             json!({ "runId": req.run_id, "kind": "tool_result", "toolCallId": call_id }),
@@ -1038,7 +974,7 @@ pub async fn execute(
                                         source: "stream".into(),
                                         dedupe_key: format!("claude:{}:result", req.run_id),
                                     };
-                                    let _ = record(&conn, &input);
+                                    let _ = store.record_usage_on(&conn, &input);
                                 }
                             }
                         }
@@ -1076,7 +1012,7 @@ pub async fn execute(
                                 source: "estimate".into(),
                                 dedupe_key: format!("estimate:{}:input", req.run_id),
                             };
-                            let _ = record(&conn, &input);
+                            let _ = store.record_usage_on(&conn, &input);
                             est_input_recorded = true;
                         }
                         let input = UsageInput {
@@ -1098,7 +1034,7 @@ pub async fn execute(
                                 req.run_id, est_output_recorded
                             ),
                         };
-                        let _ = record(&conn, &input);
+                        let _ = store.record_usage_on(&conn, &input);
                         est_output_recorded += 1024;
                         events.emit("usage.updated", json!({ "runId": req.run_id }));
                     }
@@ -1126,18 +1062,19 @@ pub async fn execute(
     }
 
     if !is_claude && !generic_output.trim().is_empty() {
-        if let Ok(conn) = db.open() {
-            let _ = insert_message(
-                &conn,
-                Some(&req.task_id),
-                Some(&req.run_id),
-                req.seat_id.as_deref(),
-                Some(&req.agent_id),
-                "chat",
-                Some("assistant"),
-                generic_output.trim(),
-                json!({ "source": "stdout" }),
-            );
+        if store
+            .insert_message(MessageRecord {
+                task_id: &req.task_id,
+                run_id: &req.run_id,
+                seat_id: req.seat_id.as_deref(),
+                agent_id: &req.agent_id,
+                kind: "chat",
+                role: Some("assistant"),
+                content: generic_output.trim(),
+                meta: json!({ "source": "stdout" }),
+            })
+            .is_ok()
+        {
             events.emit(
                 "run.delta",
                 json!({
@@ -1181,7 +1118,7 @@ pub async fn execute(
                         source: "estimate".into(),
                         dedupe_key: format!("estimate:{}:input", req.run_id),
                     };
-                    let _ = record(&conn, &input);
+                    let _ = store.record_usage_on(&conn, &input);
                 }
                 let total_output = ((generic_output.chars().count() as f64) / 4.0)
                     .ceil()
@@ -1204,7 +1141,7 @@ pub async fn execute(
                         source: "estimate".into(),
                         dedupe_key: format!("estimate:{}:out:final", req.run_id),
                     };
-                    if crate::usage::record(&conn, &input).ok().flatten().is_some() {
+                    if store.record_usage_on(&conn, &input).is_some() {
                         events.emit("usage.updated", json!({ "runId": req.run_id }));
                         budget_blocked |=
                             handle_alerts(app, &conn, &req, registry, settings.notify);
@@ -1240,7 +1177,7 @@ pub async fn execute(
                 source: "estimate".into(),
                 dedupe_key: format!("estimate:{}:fallback", req.run_id),
             };
-            if crate::usage::record(&conn, &input).ok().flatten().is_some() {
+            if store.record_usage_on(&conn, &input).is_some() {
                 events.emit("usage.updated", json!({ "runId": req.run_id }));
                 budget_blocked |= handle_alerts(app, &conn, &req, registry, settings.notify);
             }
@@ -1264,22 +1201,17 @@ pub async fn execute(
     let unseen = gate.unseen_tools(&req.run_id, &gated_calls);
     let hook_bypass = !unseen.is_empty();
     if hook_bypass {
-        if let Ok(conn) = db.open() {
-            let calls: Vec<Value> = unseen
-                .iter()
-                .take(20)
-                .map(|(tool, hash)| json!({ "tool": tool, "inputHash": hash }))
-                .collect();
-            let _ = log_event(
-                &conn,
-                Some(&req.project_id),
-                Some(&req.task_id),
-                Some(&req.run_id),
-                "hook.bypass",
-                Some("gate"),
-                json!({ "calls": calls, "count": unseen.len() }),
-            );
-        }
+        let calls: Vec<Value> = unseen
+            .iter()
+            .take(20)
+            .map(|(tool, hash)| json!({ "tool": tool, "inputHash": hash }))
+            .collect();
+        store.record_event(
+            &req,
+            "hook.bypass",
+            Some("gate"),
+            json!({ "calls": calls, "count": unseen.len() }),
+        );
         events.emit(
             "run.delta",
             json!({
@@ -1305,54 +1237,19 @@ pub async fn execute(
         outcome.error = error.clone();
     }
 
-    if let Ok(conn) = db.open() {
-        let tx = conn.unchecked_transaction().ok();
-        let run_sql = "UPDATE runs SET status = ?1, exit_code = ?2, error = ?3, ended_at = ?4, external_session_id = COALESCE(?5, external_session_id)
-             WHERE id = ?6";
-        let run_params = rusqlite::params![
-            run_status,
-            exit_code,
-            error,
-            now_ms(),
-            outcome.session_id,
-            req.run_id
-        ];
-        let agent_sql = "UPDATE agents SET status = 'idle', last_seen_at = ?1 WHERE id = ?2";
-        let agent_params = rusqlite::params![now_ms(), req.agent_id];
-        let approval_sql = "UPDATE approvals SET status = 'expired', decided_at = ?1, decision_note = '运行已结束，工具授权已失效'
-             WHERE run_id = ?2 AND type = 'tool_permission' AND status = 'pending'";
-        let approval_params = rusqlite::params![now_ms(), req.run_id];
-        match &tx {
-            Some(tx) => {
-                let _ = tx.execute(run_sql, run_params);
-                let _ = tx.execute(agent_sql, agent_params);
-                let _ = tx.execute(approval_sql, approval_params);
-            }
-            None => {
-                let _ = conn.execute(run_sql, run_params);
-                let _ = conn.execute(agent_sql, agent_params);
-                let _ = conn.execute(approval_sql, approval_params);
-            }
-        }
-        crate::budget::release(&conn, &req.run_id).ok();
-        let _ = log_event(
-            &conn,
-            Some(&req.project_id),
-            Some(&req.task_id),
-            Some(&req.run_id),
-            "run.finished",
-            Some(&req.agent_name),
-            json!({
-                "status": run_status,
-                "exitCode": exit_code,
-                "error": error,
-                "isolation": isolation,
-                "isolationReason": isolation_reason
-            }),
-        );
-        if let Some(tx) = tx {
-            let _ = tx.commit();
-        }
+    if store.finish(FinishRecord {
+        project_id: &req.project_id,
+        task_id: &req.task_id,
+        run_id: &req.run_id,
+        agent_id: &req.agent_id,
+        agent_name: &req.agent_name,
+        status: run_status,
+        exit_code,
+        error: error.as_deref(),
+        session_id: outcome.session_id.as_deref(),
+        isolation,
+        isolation_reason: isolation_reason.as_deref(),
+    }) {
         events.emit(
             "run.status",
             json!({
@@ -1526,27 +1423,13 @@ fn git_sandbox_fallback(project_path: &Path) -> Option<SandboxFallback> {
 #[cfg(windows)]
 fn log_sandbox_fallback(
     events: &dyn RunEvents,
-    db: &Db,
+    store: &RunStore,
     req: &RunRequest,
     reason: &str,
     warning: &str,
 ) {
     tracing::warn!("{warning}");
-    if let Ok(conn) = db.open() {
-        let _ = conn.execute(
-            "UPDATE runs SET isolation = 'process', isolation_reason = ?1 WHERE id = ?2",
-            rusqlite::params![reason, req.run_id],
-        );
-        let _ = log_event(
-            &conn,
-            Some(&req.project_id),
-            Some(&req.task_id),
-            Some(&req.run_id),
-            "sandbox.fallback",
-            Some("host"),
-            json!({ "reason": reason, "message": warning, "isolation": "process" }),
-        );
-    }
+    store.fallback_to_process(req, reason, warning);
     events.emit(
         "run.delta",
         json!({
