@@ -89,7 +89,7 @@ On the first local Rust command, make sure `%USERPROFILE%\.cargo\bin` is on `PAT
 React pages / components (src/pages, src/components)
         │ invoke / listen
         ▼
-Tauri commands (src-tauri/src/commands.rs, ~100 commands)
+Tauri commands (src-tauri/src/commands/, ~100 commands)
         │
         ├── SQLite (db.rs, 21 tables, WAL, versioned migrations)
         ├── orchestrator/  stage pipeline: context, prompt, gates, transitions
@@ -111,7 +111,7 @@ Tauri commands (src-tauri/src/commands.rs, ~100 commands)
 | `src/lib/api.ts` | Unified Tauri invoke / event wrapper |
 | `src/lib/mock.ts` | Backend mock for browser preview (~2,400 lines) |
 | `src/lib/taskLifecycle.ts` | Persisted task status, derived board stage, attention rules, and shared action guards |
-| `src-tauri/src/commands.rs` | Tauri command entry points and most SQL orchestration |
+| `src-tauri/src/commands/` | Domain command modules for tasks, teams, projects, runs, approvals, providers, data, usage, and system |
 | `src-tauri/src/orchestrator/` | Dispatch and resume entry points; `pipeline.rs`, `context.rs`, `gate.rs` |
 | `src-tauri/src/runtime/` | Run sessions: `session.rs`, `launch.rs`, `stream.rs`, `store.rs`, `events.rs`, `policy.rs` |
 | `src-tauri/src/approval.rs` | Hook approvals, approval rules, state consistency |
@@ -119,7 +119,7 @@ Tauri commands (src-tauri/src/commands.rs, ~100 commands)
 | `src-tauri/src/db.rs` | Schema, migrations, event sequence, messages, cleanup |
 | `src-tauri/src/sandbox/` | Windows AppContainer / named pipes / ACL |
 
-`commands.rs`, `TaskDetail.tsx`, and `mock.ts` are the three largest single files; keep changes local when editing them.
+`src-tauri/src/commands/` is split by domain; keep changes inside the owning module. `TaskDetail.tsx` and `mock.ts` remain the largest frontend files.
 
 ## Core flow
 
@@ -241,7 +241,7 @@ The optional `UPDATE_BASE_URL` variable sets the update download prefix.
 ## Handover notes
 
 1. Get "Quick start" and "Testing and acceptance" green before changing code.
-2. Read command boundaries in `commands.rs`, the task state machine in `orchestrator/pipeline.rs`, and process lifetimes in `runtime/session.rs`.
+2. Read command boundaries in `commands/`, the task state machine in `orchestrator/pipeline.rs`, and process lifetimes in `runtime/session.rs`.
 3. For changes involving approvals, budgets, processes, or data deletion, check transactions, terminal-state cleanup, and failure paths first.
 4. After UI changes run `npm run gate:ui`; after Rust changes run clippy (with `-D warnings`) and the full test suite.
 
