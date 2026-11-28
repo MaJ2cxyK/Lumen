@@ -92,7 +92,7 @@ React pages / components (src/pages, src/components)
 Tauri commands (src-tauri/src/commands.rs, ~100 commands)
         │
         ├── SQLite (db.rs, 21 tables, WAL, versioned migrations)
-        ├── orchestrator.rs  stage pipeline, gates, task transitions
+        ├── orchestrator/  stage pipeline: context, prompt, gates, transitions
         │        └── runtime/  run session: launch plan, stream-json, usage, events
         │                ├── approval.rs  tool approval gateway and rules
         │                ├── llm_proxy.rs  local model proxy, per-request budget
@@ -112,7 +112,7 @@ Tauri commands (src-tauri/src/commands.rs, ~100 commands)
 | `src/lib/mock.ts` | Backend mock for browser preview (~2,400 lines) |
 | `src/lib/taskLifecycle.ts` | Persisted task status, derived board stage, attention rules, and shared action guards |
 | `src-tauri/src/commands.rs` | Tauri command entry points and most SQL orchestration |
-| `src-tauri/src/orchestrator.rs` | Seat ordering, stage gates, dispatch, resume |
+| `src-tauri/src/orchestrator/` | Dispatch and resume entry points; `pipeline.rs`, `context.rs`, `gate.rs` |
 | `src-tauri/src/runtime/` | Run sessions: `session.rs`, `launch.rs`, `stream.rs`, `store.rs`, `events.rs`, `policy.rs` |
 | `src-tauri/src/approval.rs` | Hook approvals, approval rules, state consistency |
 | `src-tauri/src/review.rs` | Git diff, revert, commit, apply, branch, PR, snapshot rollback |
@@ -241,7 +241,7 @@ The optional `UPDATE_BASE_URL` variable sets the update download prefix.
 ## Handover notes
 
 1. Get "Quick start" and "Testing and acceptance" green before changing code.
-2. Read command boundaries in `commands.rs`, the task state machine in `orchestrator.rs`, and process lifetimes in `runtime/session.rs`.
+2. Read command boundaries in `commands.rs`, the task state machine in `orchestrator/pipeline.rs`, and process lifetimes in `runtime/session.rs`.
 3. For changes involving approvals, budgets, processes, or data deletion, check transactions, terminal-state cleanup, and failure paths first.
 4. After UI changes run `npm run gate:ui`; after Rust changes run clippy (with `-D warnings`) and the full test suite.
 
