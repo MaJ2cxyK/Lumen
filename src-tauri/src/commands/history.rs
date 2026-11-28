@@ -74,7 +74,7 @@ pub fn dashboard_summary(state: State<'_, AppState>) -> Result<DashboardSummary>
     )?;
     let agents = usage_stats::agent_stats(&conn)?;
     let series = usage_stats::series(&conn, 7)?;
-    let mut teams = teams_query(&conn, None)?;
+    let mut teams = super::teams::teams_query(&conn, None)?;
     teams.truncate(5);
     Ok(DashboardSummary {
         usage,
